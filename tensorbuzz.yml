@@ -1,4 +1,6 @@
 base_image: docker:29.3.0-cli
+# The Docker CLI image has only root; TensorBuzz otherwise defaults to a nonexistent "build" user.
+build_user_name: root
 
 environment:
   DOCKER_HOST: tcp://docker_server:2375
