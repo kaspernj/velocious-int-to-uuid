@@ -1,0 +1,10 @@
+base_image: kaspernj/tensorbuzz-base-ubuntu-26-04:latest
+
+before_script:
+  - npm ci --ignore-scripts --legacy-peer-deps
+
+builds:
+  validate:
+    name: Validate
+    script:
+      - npm run validate
