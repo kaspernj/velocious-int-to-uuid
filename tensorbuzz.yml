@@ -1,33 +1,10 @@
-base_image: docker:29.3.0-cli
-# The Docker CLI image has only root; TensorBuzz otherwise defaults to a nonexistent "build" user.
-build_user_name: root
-
-environment:
-  DOCKER_HOST: tcp://docker_server:2375
-
-services:
-  docker_server:
-    image: docker:29.3.0-dind
-    mem_limit: 4096m
-    environment:
-      DOCKER_TLS_CERTDIR: ""
-    entrypoint:
-      - /bin/sh
-      - -lc
-    command: >-
-      rm -rf /var/run/docker/containerd /run/containerd /var/lib/docker/containerd/daemon &&
-      exec dockerd-entrypoint.sh --host=tcp://0.0.0.0:2375 --tls=false
-    expose:
-      - 2375
-    privileged: true
-    restart_policy: on-failure
+base_image: kaspernj/tensorbuzz-base-ubuntu-26-04:latest
 
 before_script:
-  - until docker info >/dev/null 2>&1; do sleep 1; done
+  - npm ci --ignore-scripts --legacy-peer-deps
 
 builds:
   validate:
     name: Validate
     script:
-      - docker compose -f compose.ci.yml build package
-      - docker compose -f compose.ci.yml run --rm package npm run validate
+      - npm run validate
