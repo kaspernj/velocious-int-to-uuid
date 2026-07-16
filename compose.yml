@@ -1,0 +1,11 @@
+services:
+  package:
+    build: .
+    network_mode: none
+    working_dir: /package
+    volumes:
+      - .:/package
+      - package_node_modules:/package/node_modules
+
+volumes:
+  package_node_modules:

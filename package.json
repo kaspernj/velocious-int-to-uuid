@@ -1,0 +1,32 @@
+{
+  "name": "velocious-int-to-uuid",
+  "version": "0.1.0",
+  "description": "Safe expand-phase helpers for staged integer-to-UUID Velocious migrations",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
+  "sideEffects": false,
+  "engines": { "node": ">=20" },
+  "peerDependencies": { "velocious": ">=0.14.0" },
+  "scripts": {
+    "clean": "rm -rf dist coverage .pack-test *.tgz",
+    "lint": "eslint src test",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run clean && tsc",
+    "test": "node --test",
+    "pack:check": "npm run build && npm pack --dry-run",
+    "pack:consumer": "sh test/package-consumer.sh",
+    "validate": "npm run lint && npm run typecheck && npm test && npm run pack:check && npm run pack:consumer"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.31.0",
+    "eslint": "^9.31.0",
+    "typescript": "^5.8.3"
+  },
+  "license": "MIT"
+}
