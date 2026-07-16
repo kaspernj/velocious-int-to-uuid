@@ -59,6 +59,6 @@ docker compose run --rm package npm pack
 
 ## CI
 
-TensorBuzz runs the same `npm run validate` gate for every GitHub push and pull request from `tensorbuzz.yml`. Its Node process is isolated in the TensorBuzz build container; local development remains Docker Compose-only as above.
+TensorBuzz runs the same `npm run validate` gate for every GitHub push and pull request from `tensorbuzz.yml`. Its runner connects only to a private Docker-in-Docker service, builds `compose.ci.yml`, then runs validation with `network_mode: none`; package scripts never run on the CI worker host.
 
 MIT licensed.

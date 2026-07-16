@@ -1,10 +1,31 @@
-base_image: node:22-alpine
+base_image: docker:29.3.0-cli
+
+environment:
+  DOCKER_HOST: tcp://docker_server:2375
+
+services:
+  docker_server:
+    image: docker:29.3.0-dind
+    mem_limit: 4096m
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    entrypoint:
+      - /bin/sh
+      - -lc
+    command: >-
+      rm -rf /var/run/docker/containerd /run/containerd /var/lib/docker/containerd/daemon &&
+      exec dockerd-entrypoint.sh --host=tcp://0.0.0.0:2375 --tls=false
+    expose:
+      - 2375
+    privileged: true
+    restart_policy: on-failure
 
 before_script:
-  - npm ci --ignore-scripts --legacy-peer-deps
+  - until docker info >/dev/null 2>&1; do sleep 1; done
 
 builds:
   validate:
     name: Validate
     script:
-      - npm run validate
+      - docker compose -f compose.ci.yml build package
+      - docker compose -f compose.ci.yml run --rm package npm run validate

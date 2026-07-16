@@ -1,0 +1,6 @@
+services:
+  package:
+    build:
+      context: .
+    network_mode: none
+    working_dir: /package
