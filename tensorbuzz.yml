@@ -1,0 +1,10 @@
+base_image: node:22-alpine
+
+before_script:
+  - npm ci --ignore-scripts --legacy-peer-deps
+
+builds:
+  validate:
+    name: Validate
+    script:
+      - npm run validate

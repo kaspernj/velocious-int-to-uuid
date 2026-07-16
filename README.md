@@ -57,4 +57,8 @@ docker compose run --rm package npm pack
 
 `npm run validate` performs linting, strict `checkJs` type checking, declaration/build generation, the `node:test` suite, a package dry run, and installation of the generated tarball in an isolated ESM consumer. That consumer proves runtime import and runs its own installed TypeScript compiler against the package declarations. Build and tarball artifacts are ignored by Git.
 
+## CI
+
+TensorBuzz runs the same `npm run validate` gate for every GitHub push and pull request from `tensorbuzz.yml`. Its Node process is isolated in the TensorBuzz build container; local development remains Docker Compose-only as above.
+
 MIT licensed.

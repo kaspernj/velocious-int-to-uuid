@@ -28,5 +28,13 @@
     "eslint": "^9.31.0",
     "typescript": "^5.8.3"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaspernj/velocious-int-to-uuid.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kaspernj/velocious-int-to-uuid/issues"
+  },
+  "homepage": "https://github.com/kaspernj/velocious-int-to-uuid#readme"
 }
