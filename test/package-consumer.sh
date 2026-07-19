@@ -4,8 +4,10 @@ package_root="$(pwd)"
 
 rm -rf .pack-test
 mkdir -p .pack-test/consumer
+# npm pack runs prepack (build) and echoes its script banner to stdout; the
+# tarball filename is always the last line.
 npm pack --pack-destination .pack-test >/tmp/velocious-int-to-uuid-pack-name
-tarball="$(cat /tmp/velocious-int-to-uuid-pack-name)"
+tarball="$(tail -n 1 /tmp/velocious-int-to-uuid-pack-name)"
 cd .pack-test/consumer
 npm init --yes >/dev/null
 npm pkg set type=module >/dev/null
