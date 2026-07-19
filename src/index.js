@@ -17,7 +17,7 @@ const MAX_IDENTIFIER_LENGTH = 64
  * @property {(table: string, column: string) => boolean | Promise<boolean>} columnExists
  * @property {(table: string, name: string) => boolean | Promise<boolean>} indexExists
  * @property {(table: string, column: string, type: "string", args: AddColumnOptions) => void | Promise<void>} addColumn
- * @property {(table: string, columns: readonly string[], options: IndexOptions) => void | Promise<void>} addIndex
+ * @property {(table: string, columns: string[], options: IndexOptions) => void | Promise<void>} addIndex
  */
 
 /** @param {string} value @param {string} path */
