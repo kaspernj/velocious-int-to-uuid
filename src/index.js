@@ -106,7 +106,8 @@ async function addShadowColumn(migration, table, column) {
 async function addShadowIndex(migration, table, columns) {
   const name = indexName(table, columns)
   if (!await migration.indexExists(table, name)) {
-    await migration.addIndex(table, columns, { name, unique: false })
+    // Velocious's addIndex takes a mutable array; hand it its own copy.
+    await migration.addIndex(table, [...columns], { name, unique: false })
   }
 }
 
