@@ -42,9 +42,17 @@ Every table must explicitly provide `references` and `polymorphic` arrays, using
 
 The migration object is structural: it needs async or synchronous `columnExists(table, column)`, `indexExists(table, indexName)`, `addColumn(table, column, columnType, args)`, and `addIndex(table, columns, options)` methods. For every shadow column, the exact Velocious call is `addColumn(table, column, "string", { maxLength: 36, null: true })`, which Velocious represents as a nullable SQL `varchar(36)`. The package does not import Velocious internals at runtime. `velocious` remains a peer dependency.
 
-## Staged migration after expand
+## Deterministic backfill and verification
 
-Application owners must implement and deploy later phases separately: a resumable production backfill with observability; dual-write plus UUID-first/legacy-fallback reads; verification of completeness, uniqueness, referential consistency, and rollback readiness; then a separately reviewed contract migration and primary-key cutover. AwesomeTasks integration is intentionally deferred. None of these phases is represented by a no-op or pretend API in v0.1.
+`plan.backfill(runner, { namespace, batchSize?, onProgress? })` fills every shadow column that expand() added. UUIDs are RFC 4122 v5: `uuidV5(namespace, `${targetTable}:${integerId}`)`, so primary keys and every reference to them agree by construction without joins, reruns derive identical values, and the batched NULL-only selection makes interrupted runs resumable. The `namespace` must be a UUID that stays stable for the lifetime of the application and should be treated as a secret (for example in the backend secrets file): anyone who knows it can enumerate UUIDs from integer ids. `uuidForRecord({ namespace, table, id })` is exported so application dual-writes derive byte-identical UUIDs for new rows.
+
+The runner contract is structural like the migration contract: an object with `query(sql)` resolving to rows (a Velocious driver satisfies it). Polymorphic pairs are backfilled per discriminator mapping with the type column scoping each batch.
+
+`plan.verifyBackfill(runner)` returns `{ ok, problems, orphans }`: completeness (no NULL shadow values where a legacy value exists), `uuid_id` uniqueness per table, and join-based referential consistency (every reference shadow value equals the referenced row's `uuid_id` — this catches namespace drift without knowing the namespace). Orphaned legacy references (pointing at no row) are reported without failing the gate; they still receive derived UUIDs. Verification only reads; gating is the caller's decision, typically `if (!report.ok) throw`.
+
+## Staged migration after expand and backfill
+
+Application owners must implement and deploy later phases separately: dual-write plus UUID-first/legacy-fallback reads; then a separately reviewed contract migration and primary-key cutover. None of these phases is represented by a no-op or pretend API.
 
 ## Development
 

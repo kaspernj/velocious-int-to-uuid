@@ -18,3 +18,16 @@ await plan.expand({
 })
 
 void valid
+
+import { uuidForRecord, uuidV5 } from "velocious-int-to-uuid"
+
+const derived: string = uuidForRecord({ namespace: uuidV5("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "app"), table: "users", id: 1n })
+const report = await plan.verifyBackfill({ query: async (_sql: string) => [{ c: 0 }] })
+const reportOk: boolean = report.ok
+const problems: string[] = report.problems
+await plan.backfill({ query: async (_sql: string) => [] }, {
+  namespace: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+  batchSize: 100,
+  onProgress: (progress) => { const updated: number = progress.updated; void updated }
+})
+void [derived, reportOk, problems]
