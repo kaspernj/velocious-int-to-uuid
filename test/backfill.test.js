@@ -61,10 +61,10 @@ test("backfill fills primary keys, references, and scoped polymorphic mappings w
   const user2 = uuidForRecord({ namespace: NAMESPACE, table: "users", id: 2 })
   const post7 = uuidForRecord({ namespace: NAMESPACE, table: "posts", id: 7 })
   assert.equal(updates.length, 4)
-  assert.equal(updates[0], `UPDATE \`users\` SET \`uuid_id\` = CASE \`id\` WHEN 1 THEN '${user1}' WHEN 2 THEN '${user2}' END WHERE \`id\` IN (1, 2)`)
-  assert.equal(updates[1], `UPDATE \`posts\` SET \`uuid_id\` = CASE \`id\` WHEN 7 THEN '${post7}' END WHERE \`id\` IN (7)`)
-  assert.equal(updates[2], `UPDATE \`posts\` SET \`uuid_author_id\` = CASE \`id\` WHEN 7 THEN '${user1}' END WHERE \`id\` IN (7)`)
-  assert.equal(updates[3], `UPDATE \`posts\` SET \`uuid_subject_id\` = CASE \`id\` WHEN 7 THEN '${user2}' END WHERE \`id\` IN (7)`)
+  assert.equal(updates[0], `UPDATE \`users\` SET \`uuid_id\` = CASE \`id\` WHEN 1 THEN '${user1}' WHEN 2 THEN '${user2}' END WHERE \`id\` IN (1, 2) AND \`uuid_id\` IS NULL AND ((\`id\` = 1 AND \`id\` = 1) OR (\`id\` = 2 AND \`id\` = 2))`)
+  assert.equal(updates[1], `UPDATE \`posts\` SET \`uuid_id\` = CASE \`id\` WHEN 7 THEN '${post7}' END WHERE \`id\` IN (7) AND \`uuid_id\` IS NULL AND ((\`id\` = 7 AND \`id\` = 7))`)
+  assert.equal(updates[2], `UPDATE \`posts\` SET \`uuid_author_id\` = CASE \`id\` WHEN 7 THEN '${user1}' END WHERE \`id\` IN (7) AND \`uuid_author_id\` IS NULL AND ((\`id\` = 7 AND \`author_id\` = 1))`)
+  assert.equal(updates[3], `UPDATE \`posts\` SET \`uuid_subject_id\` = CASE \`id\` WHEN 7 THEN '${user2}' END WHERE \`id\` IN (7) AND \`uuid_subject_id\` IS NULL AND ((\`id\` = 7 AND \`subject_id\` = 2)) AND \`subject_type\` = 'User'`)
   assert.ok(runner.queries.some((sql) => sql.includes("`subject_type` = 'User'")))
   assert.ok(runner.queries.every((sql) => !sql.startsWith("SELECT") || sql.includes("IS NULL")))
   assert.deepEqual(progress, [
@@ -90,6 +90,21 @@ test("backfill loops full batches until a short batch and validates row values",
   )
 })
 
+test("backfill updates compare the selected reference source and polymorphic type", async () => {
+  const runner = new FakeRunner([
+    [],
+    [],
+    [{ id: 7, author_id: 1 }],
+    [{ id: 7, subject_id: 2 }]
+  ])
+  await UuidKeyMigration.define(spec()).backfill(runner, { namespace: NAMESPACE })
+
+  const updates = runner.queries.filter((sql) => sql.startsWith("UPDATE"))
+  assert.equal(updates.length, 2)
+  assert.match(updates[0], /`uuid_author_id` IS NULL AND \(\(`id` = 7 AND `author_id` = 1\)\)$/)
+  assert.match(updates[1], /`uuid_subject_id` IS NULL AND \(\(`id` = 7 AND `subject_id` = 2\)\) AND `subject_type` = 'User'$/)
+})
+
 test("backfill rejects bad options and control characters in discriminators", async () => {
   const plan = UuidKeyMigration.define(spec())
   await assert.rejects(plan.backfill(new FakeRunner(), { namespace: "nope" }), TypeError)
@@ -106,7 +121,7 @@ test("verifyBackfill reports ok with zero counts and collects problems and orpha
   const cleanReport = await UuidKeyMigration.define(spec()).verifyBackfill(clean)
   assert.deepEqual(cleanReport, { ok: true, problems: [], orphans: [] })
   const perTable = 2
-  const perReference = 3
+  const perReference = 4
   assert.equal(clean.queries.length, spec().tables.length * perTable + 2 * perReference)
   assert.ok(clean.queries.every((sql) => sql.startsWith("SELECT COUNT")))
 
@@ -116,6 +131,19 @@ test("verifyBackfill reports ok with zero counts and collects problems and orpha
   assert.ok(dirtyReport.problems.some((problem) => problem.includes("users.uuid_id: 4 rows without a backfilled UUID")))
   assert.ok(dirtyReport.problems.some((problem) => problem.includes("posts.uuid_author_id: 4 rows whose UUID disagrees")))
   assert.deepEqual(dirtyReport.orphans.filter((orphan) => orphan.column === "uuid_subject_id"), [{ table: "posts", column: "uuid_subject_id", count: 4 }])
+})
+
+test("verifyBackfill rejects UUID references left behind after an optional legacy reference is cleared", async () => {
+  const runner = new FakeRunner()
+  runner.query = async function (sql) {
+    this.queries.push(sql)
+    return [{ c: sql.includes("child.`author_id` IS NULL AND child.`uuid_author_id` IS NOT NULL") ? 1 : 0 }]
+  }
+
+  const report = await UuidKeyMigration.define(spec()).verifyBackfill(runner)
+  assert.equal(report.ok, false)
+  assert.ok(report.problems.includes("posts.uuid_author_id: 1 rows with a backfilled UUID but no legacy reference"))
+  assert.ok(runner.queries.includes("SELECT COUNT(*) AS c FROM `posts` AS child WHERE child.`subject_id` IS NULL AND child.`uuid_subject_id` IS NOT NULL"))
 })
 
 test("verifyBackfill aliases self-joins so self-references verify cleanly", async () => {

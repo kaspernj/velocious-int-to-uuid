@@ -193,16 +193,25 @@ async function backfillColumn(runner, { table, column, sourceColumn, targetTable
     if (rows.length === 0) return
     const cases = []
     const ids = []
+    const sourceMatches = []
     for (const row of rows) {
       const rowId = integerIdString(row.id, `${table}.id`)
       const sourceValue = integerIdString(row[sourceColumn], `${table}.${sourceColumn}`)
       const uuid = uuidForRecord({ namespace: options.namespace, table: targetTable, id: sourceValue })
       ids.push(rowId)
       cases.push(`WHEN ${rowId} THEN '${uuid}'`)
+      sourceMatches.push(`(${quoteIdentifier("id")} = ${rowId} AND ${quoteIdentifier(sourceColumn)} = ${sourceValue})`)
+    }
+    const updateConditions = [
+      `${quoteIdentifier(column)} IS NULL`,
+      `(${sourceMatches.join(" OR ")})`
+    ]
+    if (typeColumn !== undefined && typeValue !== undefined) {
+      updateConditions.push(`${quoteIdentifier(typeColumn)} = ${sqlStringLiteral(typeValue)}`)
     }
     await runner.query(
       `UPDATE ${quoteIdentifier(table)} SET ${quoteIdentifier(column)} = CASE ${quoteIdentifier("id")} ${cases.join(" ")} END ` +
-      `WHERE ${quoteIdentifier("id")} IN (${ids.join(", ")})`
+      `WHERE ${quoteIdentifier("id")} IN (${ids.join(", ")}) AND ${updateConditions.join(" AND ")}`
     )
     options.onProgress?.({ table, column, updated: rows.length })
     if (rows.length < options.batchSize) return
@@ -230,9 +239,10 @@ async function countQuery(runner, sql, context) {
  * @param {string} args.sourceColumn Legacy integer column.
  * @param {string} args.targetTable Referenced table.
  * @param {string} args.typeFilter Extra SQL condition (already quoted) or empty string.
+ * @param {boolean} args.checkNullSource Whether to run the relationship-wide NULL-source check.
  * @param {BackfillVerificationReport} args.report Report being built.
  */
-async function verifyReferenceColumn(runner, { table, column, sourceColumn, targetTable, typeFilter, report }) {
+async function verifyReferenceColumn(runner, { table, column, sourceColumn, targetTable, typeFilter, checkNullSource, report }) {
   const child = quoteIdentifier(table)
   const parent = quoteIdentifier(targetTable)
   const label = `${table}.${column}`
@@ -242,6 +252,14 @@ async function verifyReferenceColumn(runner, { table, column, sourceColumn, targ
     label
   )
   if (incomplete > 0) report.problems.push(`${label}: ${incomplete} rows with a legacy reference but no backfilled UUID`)
+  if (checkNullSource) {
+    const stale = await countQuery(
+      runner,
+      `SELECT COUNT(*) AS c FROM ${child} AS child WHERE child.${quoteIdentifier(sourceColumn)} IS NULL AND child.${quoteIdentifier(column)} IS NOT NULL`,
+      label
+    )
+    if (stale > 0) report.problems.push(`${label}: ${stale} rows with a backfilled UUID but no legacy reference`)
+  }
   const mismatched = await countQuery(
     runner,
     `SELECT COUNT(*) AS c FROM ${child} AS child INNER JOIN ${parent} AS parent ON child.${quoteIdentifier(sourceColumn)} = parent.${quoteIdentifier("id")} ` +
@@ -378,17 +396,19 @@ export class UuidKeyMigration {
               sourceColumn: `${reference.name}_id`,
               targetTable: reference.target,
               typeFilter: "",
+              checkNullSource: true,
               report
             })
           }
           for (const polymorphic of table.polymorphic) {
-            for (const mapping of polymorphic.mappings) {
+            for (const [mappingIndex, mapping] of polymorphic.mappings.entries()) {
               await verifyReferenceColumn(runner, {
                 table: table.table,
                 column: `uuid_${polymorphic.name}_id`,
                 sourceColumn: `${polymorphic.name}_id`,
                 targetTable: mapping.target,
                 typeFilter: ` AND child.${quoteIdentifier(polymorphic.typeColumn)} = ${sqlStringLiteral(mapping.type)}`,
+                checkNullSource: mappingIndex === 0,
                 report
               })
             }
