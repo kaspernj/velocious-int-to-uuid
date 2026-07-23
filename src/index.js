@@ -1,5 +1,11 @@
+import { uuidForRecord, uuidV5 } from "./uuid-v5.js"
+
+export { uuidForRecord, uuidV5 }
+
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
 const MAX_IDENTIFIER_LENGTH = 64
+const DEFAULT_BATCH_SIZE = 1000
+const MAX_BATCH_SIZE = 50000
 
 /** @typedef {{type: "varchar", length: 36}} UuidStorage */
 /** @typedef {{type: string, target: string}} PolymorphicMapping */
@@ -95,6 +101,255 @@ function validateSpec(spec) {
   return true
 }
 
+/**
+ * The deliberately narrow SQL surface used by backfill() and
+ * verifyBackfill(). Velocious drivers (and migration `execute`-style
+ * wrappers) satisfy it structurally; no runtime import is made.
+ *
+ * @typedef {object} RunnerLike
+ * @property {(sql: string) => Promise<readonly Record<string, unknown>[]> | readonly Record<string, unknown>[]} query
+ */
+
+/**
+ * @typedef {object} BackfillOptions
+ * @property {string} namespace Application namespace UUID for deterministic derivation.
+ * @property {number} [batchSize] Rows per batch, 1..50000, default 1000.
+ * @property {(progress: {table: string, column: string, updated: number}) => void} [onProgress] Called after every written batch.
+ */
+
+/**
+ * @typedef {object} BackfillVerificationReport
+ * @property {boolean} ok True when no completeness, uniqueness, or consistency problem was found. A polymorphic row whose discriminator is not one of the declared mappings (or is NULL) but still has a non-null source id is never backfilled and blocks ok.
+ * @property {string[]} problems Human-readable gate failures; empty when ok. Includes per-mapping completeness/consistency failures and, for polymorphic columns, a relationship-wide failure naming any unmapped discriminator values that leave rows unbackfilled.
+ * @property {{table: string, column: string, count: number}[]} orphans Legacy references without a target row (informational; these rows still received derived UUIDs).
+ */
+
+/** @param {string} identifier */
+function quoteIdentifier(identifier) {
+  return `\`${identifier}\``
+}
+
+/** @param {string} value */
+function sqlStringLiteral(value) {
+  for (const character of value) {
+    if (character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f) {
+      throw new TypeError("string values used in SQL must not contain control characters")
+    }
+  }
+  return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`
+}
+
+/**
+ * Case-sensitive, byte-exact discriminator equality. Manifest discriminator
+ * uniqueness is enforced with JavaScript (case-sensitive) comparison, so the
+ * generated SQL must match with the same exactness. A bare `col = 'x'` inherits
+ * the column's collation, which under a common case-insensitive collation would
+ * let `User` and `user` (distinct mappings) match the same rows ambiguously.
+ * The MariaDB/MySQL `BINARY` operator forces a byte-exact comparison regardless
+ * of the column's charset/collation.
+ * @param {string} columnExpr Quoted (optionally qualified) discriminator column.
+ * @param {string} value Declared discriminator value.
+ */
+function discriminatorEquals(columnExpr, value) {
+  return `BINARY ${columnExpr} = ${sqlStringLiteral(value)}`
+}
+
+/**
+ * Case-sensitive, byte-exact "not one of the declared values", mirroring
+ * discriminatorEquals so unmapped-discriminator detection cannot be defeated by
+ * a case-insensitive collation treating a stored value as one of the mappings.
+ * @param {string} columnExpr Quoted (optionally qualified) discriminator column.
+ * @param {readonly string[]} values Declared discriminator values.
+ */
+function discriminatorNotIn(columnExpr, values) {
+  return `BINARY ${columnExpr} NOT IN (${values.map((value) => sqlStringLiteral(value)).join(", ")})`
+}
+
+/** @param {unknown} value @param {string} context */
+function integerIdString(value, context) {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new TypeError(`${context} must be a safe integer; got the unsafe number ${String(value)} — return large ids as strings or bigint so precision is not lost`)
+  }
+  const idString = typeof value === "bigint" ? value.toString() : String(value)
+  if (!/^[0-9]+$/.test(idString)) {
+    throw new TypeError(`${context} must be a non-negative integer, got ${String(value)}`)
+  }
+  return idString
+}
+
+/** @param {unknown} value @param {string} context */
+function countFrom(value, context) {
+  const count = Number(value)
+  if (!Number.isFinite(count)) throw new TypeError(`${context} did not return a numeric count`)
+  return count
+}
+
+/** @param {BackfillOptions} options */
+function validateBackfillOptions(options) {
+  if (options === null || typeof options !== "object") throw new TypeError("backfill options must be an object")
+  uuidV5(options.namespace, "namespace-validation")
+  const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_BATCH_SIZE) {
+    throw new TypeError(`batchSize must be an integer between 1 and ${MAX_BATCH_SIZE}`)
+  }
+  return { namespace: options.namespace, batchSize, onProgress: options.onProgress }
+}
+
+/**
+ * Fills one shadow column in batches: read rows whose shadow column is still
+ * NULL, derive their UUIDs in process, write them back with a single CASE
+ * update. NULL-only selection makes reruns resume where they stopped.
+ * @param {RunnerLike} runner SQL runner.
+ * @param {object} args Arguments.
+ * @param {string} args.table Table being backfilled.
+ * @param {string} args.column Shadow column being filled.
+ * @param {string} args.sourceColumn Legacy integer column the UUID derives from.
+ * @param {string} args.targetTable Table whose namespace the UUID belongs to.
+ * @param {string | undefined} args.typeColumn Polymorphic discriminator column, when scoped.
+ * @param {string | undefined} args.typeValue Polymorphic discriminator value, when scoped.
+ * @param {{namespace: string, batchSize: number, onProgress: BackfillOptions["onProgress"]}} args.options Validated options.
+ */
+async function backfillColumn(runner, { table, column, sourceColumn, targetTable, typeColumn, typeValue, options }) {
+  const conditions = [`${quoteIdentifier(column)} IS NULL`, `${quoteIdentifier(sourceColumn)} IS NOT NULL`]
+  if (typeColumn !== undefined && typeValue !== undefined) {
+    conditions.push(discriminatorEquals(quoteIdentifier(typeColumn), typeValue))
+  }
+  const select = `SELECT ${quoteIdentifier("id")}, ${quoteIdentifier(sourceColumn)} FROM ${quoteIdentifier(table)} ` +
+    `WHERE ${conditions.join(" AND ")} ORDER BY ${quoteIdentifier("id")} LIMIT ${options.batchSize}`
+
+  for (;;) {
+    const rows = await runner.query(select)
+    if (rows.length === 0) return
+    const cases = []
+    const ids = []
+    const sourceMatches = []
+    for (const row of rows) {
+      const rowId = integerIdString(row.id, `${table}.id`)
+      const sourceValue = integerIdString(row[sourceColumn], `${table}.${sourceColumn}`)
+      const uuid = uuidForRecord({ namespace: options.namespace, table: targetTable, id: sourceValue })
+      ids.push(rowId)
+      cases.push(`WHEN ${rowId} THEN '${uuid}'`)
+      sourceMatches.push(`(${quoteIdentifier("id")} = ${rowId} AND ${quoteIdentifier(sourceColumn)} = ${sourceValue})`)
+    }
+    const updateConditions = [
+      `${quoteIdentifier(column)} IS NULL`,
+      `(${sourceMatches.join(" OR ")})`
+    ]
+    if (typeColumn !== undefined && typeValue !== undefined) {
+      updateConditions.push(discriminatorEquals(quoteIdentifier(typeColumn), typeValue))
+    }
+    await runner.query(
+      `UPDATE ${quoteIdentifier(table)} SET ${quoteIdentifier(column)} = CASE ${quoteIdentifier("id")} ${cases.join(" ")} END ` +
+      `WHERE ${quoteIdentifier("id")} IN (${ids.join(", ")}) AND ${updateConditions.join(" AND ")}`
+    )
+    options.onProgress?.({ table, column, updated: rows.length })
+    if (rows.length < options.batchSize) return
+  }
+}
+
+/**
+ * Counts rows matching a condition.
+ * @param {RunnerLike} runner SQL runner.
+ * @param {string} sql Query returning one row with a `c` column.
+ * @param {string} context Label for error messages.
+ */
+async function countQuery(runner, sql, context) {
+  const rows = await runner.query(sql)
+  return countFrom(rows[0]?.c, context)
+}
+
+/**
+ * Runs the completeness, consistency, and orphan checks for one
+ * reference-style column pair and appends findings to the report.
+ * @param {RunnerLike} runner SQL runner.
+ * @param {object} args Arguments.
+ * @param {string} args.table Referencing table.
+ * @param {string} args.column Shadow column under verification.
+ * @param {string} args.sourceColumn Legacy integer column.
+ * @param {string} args.targetTable Referenced table.
+ * @param {string} args.typeFilter Extra SQL condition (already quoted) or empty string.
+ * @param {boolean} args.checkNullSource Whether to run the relationship-wide NULL-source check.
+ * @param {BackfillVerificationReport} args.report Report being built.
+ */
+async function verifyReferenceColumn(runner, { table, column, sourceColumn, targetTable, typeFilter, checkNullSource, report }) {
+  const child = quoteIdentifier(table)
+  const parent = quoteIdentifier(targetTable)
+  const label = `${table}.${column}`
+  const incomplete = await countQuery(
+    runner,
+    `SELECT COUNT(*) AS c FROM ${child} AS child WHERE child.${quoteIdentifier(sourceColumn)} IS NOT NULL AND child.${quoteIdentifier(column)} IS NULL${typeFilter}`,
+    label
+  )
+  if (incomplete > 0) report.problems.push(`${label}: ${incomplete} rows with a legacy reference but no backfilled UUID`)
+  if (checkNullSource) {
+    const stale = await countQuery(
+      runner,
+      `SELECT COUNT(*) AS c FROM ${child} AS child WHERE child.${quoteIdentifier(sourceColumn)} IS NULL AND child.${quoteIdentifier(column)} IS NOT NULL`,
+      label
+    )
+    if (stale > 0) report.problems.push(`${label}: ${stale} rows with a backfilled UUID but no legacy reference`)
+  }
+  const mismatched = await countQuery(
+    runner,
+    `SELECT COUNT(*) AS c FROM ${child} AS child INNER JOIN ${parent} AS parent ON child.${quoteIdentifier(sourceColumn)} = parent.${quoteIdentifier("id")} ` +
+    `WHERE child.${quoteIdentifier(column)} IS NOT NULL AND parent.${quoteIdentifier("uuid_id")} IS NOT NULL AND child.${quoteIdentifier(column)} <> parent.${quoteIdentifier("uuid_id")}${typeFilter}`,
+    label
+  )
+  if (mismatched > 0) report.problems.push(`${label}: ${mismatched} rows whose UUID disagrees with the referenced ${targetTable}.uuid_id`)
+  const orphaned = await countQuery(
+    runner,
+    `SELECT COUNT(*) AS c FROM ${child} AS child LEFT JOIN ${parent} AS parent ON child.${quoteIdentifier(sourceColumn)} = parent.${quoteIdentifier("id")} ` +
+    `WHERE child.${quoteIdentifier(sourceColumn)} IS NOT NULL AND parent.${quoteIdentifier("id")} IS NULL${typeFilter}`,
+    label
+  )
+  if (orphaned > 0) report.orphans.push({ table, column, count: orphaned })
+}
+
+/**
+ * Fail-closed, relationship-wide check for one polymorphic shadow column. The
+ * per-mapping checks only ever see rows whose discriminator equals a declared
+ * mapping, so a row whose discriminator is NULL or is not one of the declared
+ * mappings has no safe target and is never backfilled. Such a row must block
+ * `ok` whatever its shadow UUID holds: gating only on a NULL shadow column
+ * would let a row with an arbitrary pre-populated UUID evade every check. This
+ * therefore groups every row with a non-null source id under an unmapped or
+ * NULL discriminator regardless of shadow state, blocks `ok`, and names the
+ * offending discriminator values so the caller can add the missing mappings.
+ * The discriminator comparison is byte-exact (case-sensitive) to match the
+ * JavaScript-case-sensitive manifest, independent of column collation.
+ * @param {RunnerLike} runner SQL runner.
+ * @param {object} args Arguments.
+ * @param {string} args.table Referencing table.
+ * @param {string} args.column Polymorphic shadow column.
+ * @param {string} args.sourceColumn Legacy integer column.
+ * @param {string} args.typeColumn Discriminator column.
+ * @param {readonly string[]} args.mappedTypes Declared discriminator values.
+ * @param {BackfillVerificationReport} args.report Report being built.
+ */
+async function verifyPolymorphicCompleteness(runner, { table, column, sourceColumn, typeColumn, mappedTypes, report }) {
+  const child = quoteIdentifier(table)
+  const label = `${table}.${column}`
+  const quotedType = quoteIdentifier(typeColumn)
+  const rows = await runner.query(
+    `SELECT COUNT(*) AS c, child.${quotedType} AS t FROM ${child} AS child ` +
+    `WHERE child.${quoteIdentifier(sourceColumn)} IS NOT NULL ` +
+    `AND (child.${quotedType} IS NULL OR ${discriminatorNotIn(`child.${quotedType}`, mappedTypes)}) ` +
+    `GROUP BY child.${quotedType}`
+  )
+  let affected = 0
+  const values = []
+  for (const row of rows) {
+    const count = countFrom(row.c, label)
+    if (count <= 0) continue
+    affected += count
+    const type = row.t
+    values.push(`${type === null || type === undefined ? "NULL" : String(type)} (${count})`)
+  }
+  if (affected > 0) {
+    report.problems.push(`${label}: ${affected} rows with a legacy reference under an unmapped or NULL ${typeColumn} discriminator (no safe backfill target): ${values.join(", ")}`)
+  }
+}
+
 /** @param {MigrationLike} migration @param {string} table @param {string} column */
 async function addShadowColumn(migration, table, column) {
   if (!await migration.columnExists(table, column)) {
@@ -135,6 +390,127 @@ export class UuidKeyMigration {
             await addShadowIndex(migration, table.table, [polymorphic.typeColumn, column])
           }
         }
+      },
+      /**
+       * Deterministically fills every shadow column added by expand().
+       * Batched, resumable, and rerunnable: only rows whose shadow column is
+       * still NULL are touched, and reruns with the same namespace derive the
+       * same UUIDs.
+       * @param {RunnerLike} runner @param {BackfillOptions} options
+       */
+      async backfill(runner, options) {
+        validateSpec(snapshot)
+        const validated = validateBackfillOptions(options)
+        for (const table of snapshot.tables) {
+          await backfillColumn(runner, {
+            table: table.table,
+            column: "uuid_id",
+            sourceColumn: "id",
+            targetTable: table.table,
+            typeColumn: undefined,
+            typeValue: undefined,
+            options: validated
+          })
+          for (const reference of table.references) {
+            await backfillColumn(runner, {
+              table: table.table,
+              column: `uuid_${reference.name}_id`,
+              sourceColumn: `${reference.name}_id`,
+              targetTable: reference.target,
+              typeColumn: undefined,
+              typeValue: undefined,
+              options: validated
+            })
+          }
+          for (const polymorphic of table.polymorphic) {
+            for (const mapping of polymorphic.mappings) {
+              await backfillColumn(runner, {
+                table: table.table,
+                column: `uuid_${polymorphic.name}_id`,
+                sourceColumn: `${polymorphic.name}_id`,
+                targetTable: mapping.target,
+                typeColumn: polymorphic.typeColumn,
+                typeValue: mapping.type,
+                options: validated
+              })
+            }
+          }
+        }
+      },
+      /**
+       * Verifies backfill completeness, uuid_id uniqueness, and join-based
+       * referential consistency. Reads only; never repairs. Orphaned legacy
+       * references are reported without failing the gate. For polymorphic
+       * columns a relationship-wide check additionally fails closed on any row
+       * whose discriminator is not one of the declared mappings (or is NULL) —
+       * regardless of what its shadow UUID currently holds, since such a row
+       * has no safe backfill target — which the per-mapping checks cannot see,
+       * and names those discriminator values. All discriminator comparisons are
+       * byte-exact (case-sensitive), matching the manifest, so a case-insensitive
+       * column collation cannot make distinct mappings alias.
+       *
+       * Each check is an independent read: verifyBackfill does not open its own
+       * transaction, so against a live, actively-written database the reads can
+       * observe different snapshots. Use it as a cutover gate only with writes
+       * quiesced, or pass a runner/transaction that gives every query one
+       * consistent snapshot.
+       * @param {RunnerLike} runner
+       * @returns {Promise<BackfillVerificationReport>}
+       */
+      async verifyBackfill(runner) {
+        validateSpec(snapshot)
+        /** @type {BackfillVerificationReport} */
+        const report = { ok: true, problems: [], orphans: [] }
+        for (const table of snapshot.tables) {
+          const quoted = quoteIdentifier(table.table)
+          const missing = await countQuery(
+            runner,
+            `SELECT COUNT(*) AS c FROM ${quoted} WHERE ${quoteIdentifier("uuid_id")} IS NULL`,
+            `${table.table}.uuid_id`
+          )
+          if (missing > 0) report.problems.push(`${table.table}.uuid_id: ${missing} rows without a backfilled UUID`)
+          const duplicated = await countQuery(
+            runner,
+            `SELECT COUNT(*) AS c FROM (SELECT ${quoteIdentifier("uuid_id")} FROM ${quoted} WHERE ${quoteIdentifier("uuid_id")} IS NOT NULL ` +
+            `GROUP BY ${quoteIdentifier("uuid_id")} HAVING COUNT(*) > 1) AS duplicated`,
+            `${table.table}.uuid_id`
+          )
+          if (duplicated > 0) report.problems.push(`${table.table}.uuid_id: ${duplicated} UUID values are duplicated`)
+          for (const reference of table.references) {
+            await verifyReferenceColumn(runner, {
+              table: table.table,
+              column: `uuid_${reference.name}_id`,
+              sourceColumn: `${reference.name}_id`,
+              targetTable: reference.target,
+              typeFilter: "",
+              checkNullSource: true,
+              report
+            })
+          }
+          for (const polymorphic of table.polymorphic) {
+            for (const [mappingIndex, mapping] of polymorphic.mappings.entries()) {
+              await verifyReferenceColumn(runner, {
+                table: table.table,
+                column: `uuid_${polymorphic.name}_id`,
+                sourceColumn: `${polymorphic.name}_id`,
+                targetTable: mapping.target,
+                typeFilter: ` AND ${discriminatorEquals(`child.${quoteIdentifier(polymorphic.typeColumn)}`, mapping.type)}`,
+                checkNullSource: mappingIndex === 0,
+                report
+              })
+            }
+            await verifyPolymorphicCompleteness(runner, {
+              table: table.table,
+              column: `uuid_${polymorphic.name}_id`,
+              sourceColumn: `${polymorphic.name}_id`,
+              typeColumn: polymorphic.typeColumn,
+              mappedTypes: polymorphic.mappings.map((mapping) => mapping.type),
+              report
+            })
+          }
+        }
+        report.ok = report.problems.length === 0
+        return report
       }
     })
   }

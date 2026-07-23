@@ -42,9 +42,21 @@ Every table must explicitly provide `references` and `polymorphic` arrays, using
 
 The migration object is structural: it needs async or synchronous `columnExists(table, column)`, `indexExists(table, indexName)`, `addColumn(table, column, columnType, args)`, and `addIndex(table, columns, options)` methods. For every shadow column, the exact Velocious call is `addColumn(table, column, "string", { maxLength: 36, null: true })`, which Velocious represents as a nullable SQL `varchar(36)`. The package does not import Velocious internals at runtime. `velocious` remains a peer dependency.
 
-## Staged migration after expand
+## Deterministic backfill and verification
 
-Application owners must implement and deploy later phases separately: a resumable production backfill with observability; dual-write plus UUID-first/legacy-fallback reads; verification of completeness, uniqueness, referential consistency, and rollback readiness; then a separately reviewed contract migration and primary-key cutover. AwesomeTasks integration is intentionally deferred. None of these phases is represented by a no-op or pretend API in v0.1.
+`plan.backfill(runner, { namespace, batchSize?, onProgress? })` fills every shadow column that expand() added. UUIDs are RFC 4122 v5: `uuidV5(namespace, `${targetTable}:${integerId}`)`, so primary keys and every reference to them agree by construction without joins, reruns derive identical values, and the batched NULL-only selection makes interrupted runs resumable. The `namespace` must be a UUID that stays stable for the lifetime of the application and should be treated as a secret (for example in the backend secrets file): anyone who knows it can enumerate UUIDs from integer ids. `uuidForRecord({ namespace, table, id })` is exported so application dual-writes derive byte-identical UUIDs for new rows.
+
+The runner contract is structural like the migration contract: an object with `query(sql)` resolving to rows (a Velocious driver satisfies it). Polymorphic pairs are backfilled per discriminator mapping with the type column scoping each batch. Discriminator matching is byte-exact (case-sensitive) via the MariaDB/MySQL `BINARY` operator, so distinct manifest mappings such as `User` and `user` cannot alias each other under a case-insensitive column collation.
+
+Integer ids are read from rows and interpolated into SQL predicates and UUID derivation exactly, so precision must not be lost on the way in. A JavaScript `number` id is only accepted when it is a safe integer (`Number.isSafeInteger`); an unsafe `number` (a value past 2^53 that a driver may already have rounded) is rejected with a clear error. Drivers must return large ids as decimal strings or `bigint`, both of which are accepted as-is.
+
+`plan.verifyBackfill(runner)` returns `{ ok, problems, orphans }`: completeness (no NULL shadow values where a legacy value exists), `uuid_id` uniqueness per table, and join-based referential consistency (every reference shadow value equals the referenced row's `uuid_id` — this catches namespace drift without knowing the namespace). For polymorphic columns, in addition to the per-mapping checks (also byte-exact/case-sensitive), a relationship-wide check fails closed on every row that has a non-null source id but whose discriminator is not one of the declared mappings (or is NULL), **regardless of what the shadow UUID currently holds** — such a row has no safe backfill target, so an arbitrary pre-populated UUID must not let it pass. The report names the offending discriminator values so the missing mappings can be added. Orphaned legacy references (pointing at no row) are reported without failing the gate; they still receive derived UUIDs. Verification only reads; gating is the caller's decision, typically `if (!report.ok) throw`.
+
+`verifyBackfill` runs each check as an independent read and opens no transaction of its own, so against a live, actively-written database successive queries can observe different snapshots. Treat it as a cutover gate only with writes quiesced, or pass a runner/transaction that serves every query one consistent snapshot.
+
+## Staged migration after expand and backfill
+
+Application owners must implement and deploy later phases separately: dual-write plus UUID-first/legacy-fallback reads; then a separately reviewed contract migration and primary-key cutover. None of these phases is represented by a no-op or pretend API.
 
 ## Development
 
