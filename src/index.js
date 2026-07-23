@@ -165,6 +165,17 @@ function discriminatorNotIn(columnExpr, values) {
   return `BINARY ${columnExpr} NOT IN (${values.map((value) => sqlStringLiteral(value)).join(", ")})`
 }
 
+/**
+ * Byte-exact UUID inequality for cross-column verification. Applying the
+ * MariaDB/MySQL BINARY operator to both operands prevents either varchar
+ * column's collation from being selected for the comparison.
+ * @param {string} leftExpr Quoted (optionally qualified) UUID column.
+ * @param {string} rightExpr Quoted (optionally qualified) UUID column.
+ */
+function uuidNotEqual(leftExpr, rightExpr) {
+  return `BINARY ${leftExpr} <> BINARY ${rightExpr}`
+}
+
 /** @param {unknown} value @param {string} context */
 function integerIdString(value, context) {
   if (typeof value === "number" && !Number.isSafeInteger(value)) {
@@ -292,7 +303,8 @@ async function verifyReferenceColumn(runner, { table, column, sourceColumn, targ
   const mismatched = await countQuery(
     runner,
     `SELECT COUNT(*) AS c FROM ${child} AS child INNER JOIN ${parent} AS parent ON child.${quoteIdentifier(sourceColumn)} = parent.${quoteIdentifier("id")} ` +
-    `WHERE child.${quoteIdentifier(column)} IS NOT NULL AND parent.${quoteIdentifier("uuid_id")} IS NOT NULL AND child.${quoteIdentifier(column)} <> parent.${quoteIdentifier("uuid_id")}${typeFilter}`,
+    `WHERE child.${quoteIdentifier(column)} IS NOT NULL AND parent.${quoteIdentifier("uuid_id")} IS NOT NULL AND ` +
+    `${uuidNotEqual(`child.${quoteIdentifier(column)}`, `parent.${quoteIdentifier("uuid_id")}`)}${typeFilter}`,
     label
   )
   if (mismatched > 0) report.problems.push(`${label}: ${mismatched} rows whose UUID disagrees with the referenced ${targetTable}.uuid_id`)

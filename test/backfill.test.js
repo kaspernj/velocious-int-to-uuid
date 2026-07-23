@@ -217,6 +217,20 @@ test("verifyBackfill compares polymorphic discriminators case-sensitively via BI
   assert.ok(runner.queries.every((sql) => !sql.includes("child.`subject_type`") || sql.includes("BINARY child.`subject_type`")))
 })
 
+test("verifyBackfill compares normal and polymorphic UUID references bytewise", async () => {
+  const runner = new FakeRunner([], 0)
+  await UuidKeyMigration.define(spec()).verifyBackfill(runner)
+  const mismatchQueries = runner.queries.filter((sql) => (
+    sql.includes("INNER JOIN") &&
+    sql.includes("child.`uuid_") &&
+    sql.includes("parent.`uuid_id`")
+  ))
+
+  assert.equal(mismatchQueries.length, 2)
+  assert.ok(mismatchQueries.some((sql) => sql.includes("BINARY child.`uuid_author_id` <> BINARY parent.`uuid_id`")))
+  assert.ok(mismatchQueries.some((sql) => sql.includes("BINARY child.`uuid_subject_id` <> BINARY parent.`uuid_id`")))
+})
+
 test("verifyBackfill rejects UUID references left behind after an optional legacy reference is cleared", async () => {
   const runner = new FakeRunner()
   runner.query = async function (sql) {

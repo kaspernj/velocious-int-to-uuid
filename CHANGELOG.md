@@ -4,6 +4,7 @@
 
 - Add deterministic, batched, resumable backfill (plan.backfill) deriving RFC 4122 v5 UUIDs from a caller-supplied namespace, with progress callbacks.
 - Add read-only verification gates (plan.verifyBackfill): completeness, uuid_id uniqueness, join-based referential consistency, and informational orphan counts.
+- Compare related UUID columns bytewise with the MariaDB/MySQL BINARY operator during verification, avoiding collation errors when child and parent UUID columns use different collations.
 - verifyBackfill now fails closed on polymorphic rows whose discriminator is not one of the declared mappings (or is NULL): such rows have no safe backfill target and are flagged regardless of what the shadow UUID currently holds (an arbitrary pre-populated UUID no longer lets them pass), and the report names the unmapped discriminator values instead of silently passing.
 - Compare polymorphic discriminators byte-exactly (case-sensitive) via the MariaDB/MySQL BINARY operator in backfill selection/update, per-mapping verification, and unmapped detection, so distinct manifest mappings (e.g. `User` vs `user`) cannot alias under a case-insensitive column collation.
 - Reject unsafe JavaScript `number` ids (values past 2^53 that a driver may have rounded) at the boundary in backfill and uuidForRecord, directing callers to return large ids as strings or bigint; valid integer strings and bigint are unchanged.
