@@ -139,6 +139,32 @@ function sqlStringLiteral(value) {
   return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`
 }
 
+/**
+ * Case-sensitive, byte-exact discriminator equality. Manifest discriminator
+ * uniqueness is enforced with JavaScript (case-sensitive) comparison, so the
+ * generated SQL must match with the same exactness. A bare `col = 'x'` inherits
+ * the column's collation, which under a common case-insensitive collation would
+ * let `User` and `user` (distinct mappings) match the same rows ambiguously.
+ * The MariaDB/MySQL `BINARY` operator forces a byte-exact comparison regardless
+ * of the column's charset/collation.
+ * @param {string} columnExpr Quoted (optionally qualified) discriminator column.
+ * @param {string} value Declared discriminator value.
+ */
+function discriminatorEquals(columnExpr, value) {
+  return `BINARY ${columnExpr} = ${sqlStringLiteral(value)}`
+}
+
+/**
+ * Case-sensitive, byte-exact "not one of the declared values", mirroring
+ * discriminatorEquals so unmapped-discriminator detection cannot be defeated by
+ * a case-insensitive collation treating a stored value as one of the mappings.
+ * @param {string} columnExpr Quoted (optionally qualified) discriminator column.
+ * @param {readonly string[]} values Declared discriminator values.
+ */
+function discriminatorNotIn(columnExpr, values) {
+  return `BINARY ${columnExpr} NOT IN (${values.map((value) => sqlStringLiteral(value)).join(", ")})`
+}
+
 /** @param {unknown} value @param {string} context */
 function integerIdString(value, context) {
   if (typeof value === "number" && !Number.isSafeInteger(value)) {
@@ -186,7 +212,7 @@ function validateBackfillOptions(options) {
 async function backfillColumn(runner, { table, column, sourceColumn, targetTable, typeColumn, typeValue, options }) {
   const conditions = [`${quoteIdentifier(column)} IS NULL`, `${quoteIdentifier(sourceColumn)} IS NOT NULL`]
   if (typeColumn !== undefined && typeValue !== undefined) {
-    conditions.push(`${quoteIdentifier(typeColumn)} = ${sqlStringLiteral(typeValue)}`)
+    conditions.push(discriminatorEquals(quoteIdentifier(typeColumn), typeValue))
   }
   const select = `SELECT ${quoteIdentifier("id")}, ${quoteIdentifier(sourceColumn)} FROM ${quoteIdentifier(table)} ` +
     `WHERE ${conditions.join(" AND ")} ORDER BY ${quoteIdentifier("id")} LIMIT ${options.batchSize}`
@@ -210,7 +236,7 @@ async function backfillColumn(runner, { table, column, sourceColumn, targetTable
       `(${sourceMatches.join(" OR ")})`
     ]
     if (typeColumn !== undefined && typeValue !== undefined) {
-      updateConditions.push(`${quoteIdentifier(typeColumn)} = ${sqlStringLiteral(typeValue)}`)
+      updateConditions.push(discriminatorEquals(quoteIdentifier(typeColumn), typeValue))
     }
     await runner.query(
       `UPDATE ${quoteIdentifier(table)} SET ${quoteIdentifier(column)} = CASE ${quoteIdentifier("id")} ${cases.join(" ")} END ` +
@@ -280,13 +306,17 @@ async function verifyReferenceColumn(runner, { table, column, sourceColumn, targ
 }
 
 /**
- * Fail-closed, relationship-wide completeness check for one polymorphic shadow
- * column. The per-mapping checks only ever see rows whose discriminator equals
- * a declared mapping, so a row whose discriminator is NULL or is not one of the
- * declared mappings is never backfilled and would otherwise pass verification
- * silently. This groups every still-NULL shadow row that has a non-null source
- * id under a discriminator with no declared mapping, blocks `ok`, and names the
+ * Fail-closed, relationship-wide check for one polymorphic shadow column. The
+ * per-mapping checks only ever see rows whose discriminator equals a declared
+ * mapping, so a row whose discriminator is NULL or is not one of the declared
+ * mappings has no safe target and is never backfilled. Such a row must block
+ * `ok` whatever its shadow UUID holds: gating only on a NULL shadow column
+ * would let a row with an arbitrary pre-populated UUID evade every check. This
+ * therefore groups every row with a non-null source id under an unmapped or
+ * NULL discriminator regardless of shadow state, blocks `ok`, and names the
  * offending discriminator values so the caller can add the missing mappings.
+ * The discriminator comparison is byte-exact (case-sensitive) to match the
+ * JavaScript-case-sensitive manifest, independent of column collation.
  * @param {RunnerLike} runner SQL runner.
  * @param {object} args Arguments.
  * @param {string} args.table Referencing table.
@@ -300,24 +330,23 @@ async function verifyPolymorphicCompleteness(runner, { table, column, sourceColu
   const child = quoteIdentifier(table)
   const label = `${table}.${column}`
   const quotedType = quoteIdentifier(typeColumn)
-  const mappedLiterals = mappedTypes.map((type) => sqlStringLiteral(type)).join(", ")
   const rows = await runner.query(
     `SELECT COUNT(*) AS c, child.${quotedType} AS t FROM ${child} AS child ` +
-    `WHERE child.${quoteIdentifier(sourceColumn)} IS NOT NULL AND child.${quoteIdentifier(column)} IS NULL ` +
-    `AND (child.${quotedType} IS NULL OR child.${quotedType} NOT IN (${mappedLiterals})) ` +
+    `WHERE child.${quoteIdentifier(sourceColumn)} IS NOT NULL ` +
+    `AND (child.${quotedType} IS NULL OR ${discriminatorNotIn(`child.${quotedType}`, mappedTypes)}) ` +
     `GROUP BY child.${quotedType}`
   )
-  let incomplete = 0
+  let affected = 0
   const values = []
   for (const row of rows) {
     const count = countFrom(row.c, label)
     if (count <= 0) continue
-    incomplete += count
+    affected += count
     const type = row.t
     values.push(`${type === null || type === undefined ? "NULL" : String(type)} (${count})`)
   }
-  if (incomplete > 0) {
-    report.problems.push(`${label}: ${incomplete} rows with a legacy reference but no backfilled UUID under unmapped ${typeColumn} discriminator values: ${values.join(", ")}`)
+  if (affected > 0) {
+    report.problems.push(`${label}: ${affected} rows with a legacy reference under an unmapped or NULL ${typeColumn} discriminator (no safe backfill target): ${values.join(", ")}`)
   }
 }
 
@@ -412,10 +441,19 @@ export class UuidKeyMigration {
        * Verifies backfill completeness, uuid_id uniqueness, and join-based
        * referential consistency. Reads only; never repairs. Orphaned legacy
        * references are reported without failing the gate. For polymorphic
-       * columns a relationship-wide check additionally fails closed on rows
-       * whose discriminator is not one of the declared mappings (or is NULL),
-       * which the per-mapping checks cannot see, and names those discriminator
-       * values.
+       * columns a relationship-wide check additionally fails closed on any row
+       * whose discriminator is not one of the declared mappings (or is NULL) —
+       * regardless of what its shadow UUID currently holds, since such a row
+       * has no safe backfill target — which the per-mapping checks cannot see,
+       * and names those discriminator values. All discriminator comparisons are
+       * byte-exact (case-sensitive), matching the manifest, so a case-insensitive
+       * column collation cannot make distinct mappings alias.
+       *
+       * Each check is an independent read: verifyBackfill does not open its own
+       * transaction, so against a live, actively-written database the reads can
+       * observe different snapshots. Use it as a cutover gate only with writes
+       * quiesced, or pass a runner/transaction that gives every query one
+       * consistent snapshot.
        * @param {RunnerLike} runner
        * @returns {Promise<BackfillVerificationReport>}
        */
@@ -456,7 +494,7 @@ export class UuidKeyMigration {
                 column: `uuid_${polymorphic.name}_id`,
                 sourceColumn: `${polymorphic.name}_id`,
                 targetTable: mapping.target,
-                typeFilter: ` AND child.${quoteIdentifier(polymorphic.typeColumn)} = ${sqlStringLiteral(mapping.type)}`,
+                typeFilter: ` AND ${discriminatorEquals(`child.${quoteIdentifier(polymorphic.typeColumn)}`, mapping.type)}`,
                 checkNullSource: mappingIndex === 0,
                 report
               })

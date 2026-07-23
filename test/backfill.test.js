@@ -73,8 +73,8 @@ test("backfill fills primary keys, references, and scoped polymorphic mappings w
   assert.equal(updates[0], `UPDATE \`users\` SET \`uuid_id\` = CASE \`id\` WHEN 1 THEN '${user1}' WHEN 2 THEN '${user2}' END WHERE \`id\` IN (1, 2) AND \`uuid_id\` IS NULL AND ((\`id\` = 1 AND \`id\` = 1) OR (\`id\` = 2 AND \`id\` = 2))`)
   assert.equal(updates[1], `UPDATE \`posts\` SET \`uuid_id\` = CASE \`id\` WHEN 7 THEN '${post7}' END WHERE \`id\` IN (7) AND \`uuid_id\` IS NULL AND ((\`id\` = 7 AND \`id\` = 7))`)
   assert.equal(updates[2], `UPDATE \`posts\` SET \`uuid_author_id\` = CASE \`id\` WHEN 7 THEN '${user1}' END WHERE \`id\` IN (7) AND \`uuid_author_id\` IS NULL AND ((\`id\` = 7 AND \`author_id\` = 1))`)
-  assert.equal(updates[3], `UPDATE \`posts\` SET \`uuid_subject_id\` = CASE \`id\` WHEN 7 THEN '${user2}' END WHERE \`id\` IN (7) AND \`uuid_subject_id\` IS NULL AND ((\`id\` = 7 AND \`subject_id\` = 2)) AND \`subject_type\` = 'User'`)
-  assert.ok(runner.queries.some((sql) => sql.includes("`subject_type` = 'User'")))
+  assert.equal(updates[3], `UPDATE \`posts\` SET \`uuid_subject_id\` = CASE \`id\` WHEN 7 THEN '${user2}' END WHERE \`id\` IN (7) AND \`uuid_subject_id\` IS NULL AND ((\`id\` = 7 AND \`subject_id\` = 2)) AND BINARY \`subject_type\` = 'User'`)
+  assert.ok(runner.queries.some((sql) => sql.includes("BINARY `subject_type` = 'User'")))
   assert.ok(runner.queries.every((sql) => !sql.startsWith("SELECT") || sql.includes("IS NULL")))
   assert.deepEqual(progress, [
     { table: "users", column: "uuid_id", updated: 2 },
@@ -120,7 +120,17 @@ test("backfill updates compare the selected reference source and polymorphic typ
   const updates = runner.queries.filter((sql) => sql.startsWith("UPDATE"))
   assert.equal(updates.length, 2)
   assert.match(updates[0], /`uuid_author_id` IS NULL AND \(\(`id` = 7 AND `author_id` = 1\)\)$/)
-  assert.match(updates[1], /`uuid_subject_id` IS NULL AND \(\(`id` = 7 AND `subject_id` = 2\)\) AND `subject_type` = 'User'$/)
+  assert.match(updates[1], /`uuid_subject_id` IS NULL AND \(\(`id` = 7 AND `subject_id` = 2\)\) AND BINARY `subject_type` = 'User'$/)
+})
+
+test("backfill compares polymorphic discriminators case-sensitively via BINARY in select and update", async () => {
+  const runner = new FakeRunner([[], [], [], [{ id: 7, subject_id: 2 }]])
+  await UuidKeyMigration.define(spec()).backfill(runner, { namespace: NAMESPACE })
+  const selects = runner.queries.filter((sql) => sql.startsWith("SELECT") && sql.includes("subject_type"))
+  const updates = runner.queries.filter((sql) => sql.startsWith("UPDATE") && sql.includes("subject_type"))
+  assert.ok(selects.length > 0 && selects.every((sql) => sql.includes("BINARY `subject_type` = 'User'")))
+  assert.ok(updates.length > 0 && updates.every((sql) => sql.includes("BINARY `subject_type` = 'User'")))
+  assert.ok(runner.queries.every((sql) => !sql.includes("subject_type") || sql.includes("BINARY `subject_type`")))
 })
 
 test("backfill rejects bad options and control characters in discriminators", async () => {
@@ -164,6 +174,47 @@ test("verifyBackfill fails closed when a polymorphic row has an unmapped discrim
   assert.equal(report.ok, false)
   assert.ok(report.problems.some((problem) => problem.includes("uuid_subject_id") && problem.includes("Comment")))
   assert.ok(runner.queries.some((sql) => sql.includes("`subject_type`") && sql.includes("NOT IN") && sql.includes("GROUP BY")))
+})
+
+test("verifyBackfill detects unmapped/NULL discriminators regardless of shadow UUID state", async () => {
+  // Structural: detection must gate on the legacy source id, never on the shadow UUID being NULL,
+  // otherwise a row with an arbitrary pre-populated UUID evades the check.
+  const captured = new FakeRunner([], 0)
+  await UuidKeyMigration.define(spec()).verifyBackfill(captured)
+  const detection = captured.queries.find((sql) => sql.includes("NOT IN") && sql.includes("GROUP BY"))
+  assert.ok(detection, "expected an unmapped-discriminator detection query")
+  assert.ok(detection.includes("child.`subject_id` IS NOT NULL"))
+  assert.ok(!detection.includes("`uuid_subject_id` IS NULL"))
+
+  // Behavioral: a row whose shadow UUID is already populated is only surfaced once the shadow-NULL gate is gone.
+  const populated = new FakeRunner()
+  populated.query = async function (sql) {
+    this.queries.push(sql)
+    if (sql.includes("NOT IN") && !sql.includes("`uuid_subject_id` IS NULL")) return [{ c: 2, t: "Comment" }]
+    return [{ c: 0 }]
+  }
+  const populatedReport = await UuidKeyMigration.define(spec()).verifyBackfill(populated)
+  assert.equal(populatedReport.ok, false)
+  assert.ok(populatedReport.problems.some((problem) => problem.includes("uuid_subject_id") && problem.includes("Comment")))
+
+  // Behavioral: an explicit NULL discriminator with a populated shadow UUID is likewise flagged.
+  const nullType = new FakeRunner()
+  nullType.query = async function (sql) {
+    this.queries.push(sql)
+    if (sql.includes("NOT IN") && !sql.includes("`uuid_subject_id` IS NULL")) return [{ c: 1, t: null }]
+    return [{ c: 0 }]
+  }
+  const nullReport = await UuidKeyMigration.define(spec()).verifyBackfill(nullType)
+  assert.equal(nullReport.ok, false)
+  assert.ok(nullReport.problems.some((problem) => problem.includes("uuid_subject_id") && problem.includes("NULL")))
+})
+
+test("verifyBackfill compares polymorphic discriminators case-sensitively via BINARY", async () => {
+  const runner = new FakeRunner([], 0)
+  await UuidKeyMigration.define(spec()).verifyBackfill(runner)
+  assert.ok(runner.queries.some((sql) => sql.includes("BINARY child.`subject_type` = 'User'")))
+  assert.ok(runner.queries.some((sql) => sql.includes("BINARY child.`subject_type` NOT IN ('User')")))
+  assert.ok(runner.queries.every((sql) => !sql.includes("child.`subject_type`") || sql.includes("BINARY child.`subject_type`")))
 })
 
 test("verifyBackfill rejects UUID references left behind after an optional legacy reference is cleared", async () => {
