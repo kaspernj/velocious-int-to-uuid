@@ -43,6 +43,15 @@ test("uuidForRecord derives from table and integer id and rejects non-integers",
   assert.throws(() => uuidForRecord({ namespace: "not-a-uuid", table: "users", id: 1 }))
 })
 
+test("uuidForRecord rejects unsafe integer numbers but keeps string and bigint for large ids", () => {
+  assert.throws(() => uuidForRecord({ namespace: NAMESPACE, table: "users", id: Number.MAX_SAFE_INTEGER + 1 }), /safe integer/)
+  assert.throws(() => uuidForRecord({ namespace: NAMESPACE, table: "users", id: 1e21 }), /safe integer/)
+  assert.equal(
+    uuidForRecord({ namespace: NAMESPACE, table: "users", id: "9007199254740993" }),
+    uuidForRecord({ namespace: NAMESPACE, table: "users", id: 9007199254740993n })
+  )
+})
+
 test("backfill fills primary keys, references, and scoped polymorphic mappings with derived UUIDs", async () => {
   const runner = new FakeRunner([
     [{ id: 1 }, { id: 2 }],
@@ -90,6 +99,15 @@ test("backfill loops full batches until a short batch and validates row values",
   )
 })
 
+test("backfill rejects unsafe integer numbers returned by the driver", async () => {
+  const unsafe = new FakeRunner([[{ id: Number.MAX_SAFE_INTEGER + 1 }]])
+  await assert.rejects(
+    UuidKeyMigration.define({ tables: [{ table: "users", references: [], polymorphic: [] }] })
+      .backfill(unsafe, { namespace: NAMESPACE }),
+    /safe integer/
+  )
+})
+
 test("backfill updates compare the selected reference source and polymorphic type", async () => {
   const runner = new FakeRunner([
     [],
@@ -122,7 +140,8 @@ test("verifyBackfill reports ok with zero counts and collects problems and orpha
   assert.deepEqual(cleanReport, { ok: true, problems: [], orphans: [] })
   const perTable = 2
   const perReference = 4
-  assert.equal(clean.queries.length, spec().tables.length * perTable + 2 * perReference)
+  const perPolymorphicCompleteness = 1
+  assert.equal(clean.queries.length, spec().tables.length * perTable + 2 * perReference + perPolymorphicCompleteness)
   assert.ok(clean.queries.every((sql) => sql.startsWith("SELECT COUNT")))
 
   const dirty = new FakeRunner([], 4)
@@ -131,6 +150,20 @@ test("verifyBackfill reports ok with zero counts and collects problems and orpha
   assert.ok(dirtyReport.problems.some((problem) => problem.includes("users.uuid_id: 4 rows without a backfilled UUID")))
   assert.ok(dirtyReport.problems.some((problem) => problem.includes("posts.uuid_author_id: 4 rows whose UUID disagrees")))
   assert.deepEqual(dirtyReport.orphans.filter((orphan) => orphan.column === "uuid_subject_id"), [{ table: "posts", column: "uuid_subject_id", count: 4 }])
+})
+
+test("verifyBackfill fails closed when a polymorphic row has an unmapped discriminator", async () => {
+  const runner = new FakeRunner()
+  runner.query = async function (sql) {
+    this.queries.push(sql)
+    if (sql.includes("NOT IN")) return [{ c: 3, t: "Comment" }]
+    return [{ c: 0 }]
+  }
+
+  const report = await UuidKeyMigration.define(spec()).verifyBackfill(runner)
+  assert.equal(report.ok, false)
+  assert.ok(report.problems.some((problem) => problem.includes("uuid_subject_id") && problem.includes("Comment")))
+  assert.ok(runner.queries.some((sql) => sql.includes("`subject_type`") && sql.includes("NOT IN") && sql.includes("GROUP BY")))
 })
 
 test("verifyBackfill rejects UUID references left behind after an optional legacy reference is cleared", async () => {

@@ -49,6 +49,9 @@ export function uuidForRecord({ namespace, table, id }) {
   if (typeof table !== "string" || table.length === 0) {
     throw new TypeError("table must be a non-empty string")
   }
+  if (typeof id === "number" && !Number.isSafeInteger(id)) {
+    throw new TypeError(`id must be a safe integer; got the unsafe number ${String(id)} — return large ids as strings or bigint so precision is not lost`)
+  }
   const idString = typeof id === "bigint" ? id.toString() : String(id)
   if (!/^[0-9]+$/.test(idString)) {
     throw new TypeError(`id must be a non-negative integer, got ${String(id)}`)

@@ -119,8 +119,8 @@ function validateSpec(spec) {
 
 /**
  * @typedef {object} BackfillVerificationReport
- * @property {boolean} ok True when no completeness, uniqueness, or consistency problem was found.
- * @property {string[]} problems Human-readable gate failures; empty when ok.
+ * @property {boolean} ok True when no completeness, uniqueness, or consistency problem was found. A polymorphic row whose discriminator is not one of the declared mappings (or is NULL) but still has a non-null source id is never backfilled and blocks ok.
+ * @property {string[]} problems Human-readable gate failures; empty when ok. Includes per-mapping completeness/consistency failures and, for polymorphic columns, a relationship-wide failure naming any unmapped discriminator values that leave rows unbackfilled.
  * @property {{table: string, column: string, count: number}[]} orphans Legacy references without a target row (informational; these rows still received derived UUIDs).
  */
 
@@ -141,6 +141,9 @@ function sqlStringLiteral(value) {
 
 /** @param {unknown} value @param {string} context */
 function integerIdString(value, context) {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new TypeError(`${context} must be a safe integer; got the unsafe number ${String(value)} — return large ids as strings or bigint so precision is not lost`)
+  }
   const idString = typeof value === "bigint" ? value.toString() : String(value)
   if (!/^[0-9]+$/.test(idString)) {
     throw new TypeError(`${context} must be a non-negative integer, got ${String(value)}`)
@@ -276,6 +279,48 @@ async function verifyReferenceColumn(runner, { table, column, sourceColumn, targ
   if (orphaned > 0) report.orphans.push({ table, column, count: orphaned })
 }
 
+/**
+ * Fail-closed, relationship-wide completeness check for one polymorphic shadow
+ * column. The per-mapping checks only ever see rows whose discriminator equals
+ * a declared mapping, so a row whose discriminator is NULL or is not one of the
+ * declared mappings is never backfilled and would otherwise pass verification
+ * silently. This groups every still-NULL shadow row that has a non-null source
+ * id under a discriminator with no declared mapping, blocks `ok`, and names the
+ * offending discriminator values so the caller can add the missing mappings.
+ * @param {RunnerLike} runner SQL runner.
+ * @param {object} args Arguments.
+ * @param {string} args.table Referencing table.
+ * @param {string} args.column Polymorphic shadow column.
+ * @param {string} args.sourceColumn Legacy integer column.
+ * @param {string} args.typeColumn Discriminator column.
+ * @param {readonly string[]} args.mappedTypes Declared discriminator values.
+ * @param {BackfillVerificationReport} args.report Report being built.
+ */
+async function verifyPolymorphicCompleteness(runner, { table, column, sourceColumn, typeColumn, mappedTypes, report }) {
+  const child = quoteIdentifier(table)
+  const label = `${table}.${column}`
+  const quotedType = quoteIdentifier(typeColumn)
+  const mappedLiterals = mappedTypes.map((type) => sqlStringLiteral(type)).join(", ")
+  const rows = await runner.query(
+    `SELECT COUNT(*) AS c, child.${quotedType} AS t FROM ${child} AS child ` +
+    `WHERE child.${quoteIdentifier(sourceColumn)} IS NOT NULL AND child.${quoteIdentifier(column)} IS NULL ` +
+    `AND (child.${quotedType} IS NULL OR child.${quotedType} NOT IN (${mappedLiterals})) ` +
+    `GROUP BY child.${quotedType}`
+  )
+  let incomplete = 0
+  const values = []
+  for (const row of rows) {
+    const count = countFrom(row.c, label)
+    if (count <= 0) continue
+    incomplete += count
+    const type = row.t
+    values.push(`${type === null || type === undefined ? "NULL" : String(type)} (${count})`)
+  }
+  if (incomplete > 0) {
+    report.problems.push(`${label}: ${incomplete} rows with a legacy reference but no backfilled UUID under unmapped ${typeColumn} discriminator values: ${values.join(", ")}`)
+  }
+}
+
 /** @param {MigrationLike} migration @param {string} table @param {string} column */
 async function addShadowColumn(migration, table, column) {
   if (!await migration.columnExists(table, column)) {
@@ -366,7 +411,11 @@ export class UuidKeyMigration {
       /**
        * Verifies backfill completeness, uuid_id uniqueness, and join-based
        * referential consistency. Reads only; never repairs. Orphaned legacy
-       * references are reported without failing the gate.
+       * references are reported without failing the gate. For polymorphic
+       * columns a relationship-wide check additionally fails closed on rows
+       * whose discriminator is not one of the declared mappings (or is NULL),
+       * which the per-mapping checks cannot see, and names those discriminator
+       * values.
        * @param {RunnerLike} runner
        * @returns {Promise<BackfillVerificationReport>}
        */
@@ -412,6 +461,14 @@ export class UuidKeyMigration {
                 report
               })
             }
+            await verifyPolymorphicCompleteness(runner, {
+              table: table.table,
+              column: `uuid_${polymorphic.name}_id`,
+              sourceColumn: `${polymorphic.name}_id`,
+              typeColumn: polymorphic.typeColumn,
+              mappedTypes: polymorphic.mappings.map((mapping) => mapping.type),
+              report
+            })
           }
         }
         report.ok = report.problems.length === 0
