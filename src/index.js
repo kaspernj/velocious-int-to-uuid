@@ -15,6 +15,9 @@ const MAX_BATCH_SIZE = 50000
 /** @typedef {{uuidStorage?: UuidStorage, tables: readonly TableSpec[]}} MigrationSpec */
 /** @typedef {{maxLength: 36, null: true}} AddColumnOptions */
 /** @typedef {{name: string, unique: false}} IndexOptions */
+/** @typedef {{kind: "rename-column", table: string, from: string, to: string}} CutoverStep */
+/** @typedef {{table: string, sourceColumn: string, retainedAs: string, restoreTo: string, phase: string}} RetainedColumn */
+/** @typedef {{table: string, liveColumn: string, shadowColumn: string, retainedColumn: string}} CutoverColumn */
 /**
  * The deliberately narrow migration surface used by expand(). Velocious migration
  * instances and test fakes can satisfy this structurally; no runtime import is made.
@@ -24,6 +27,16 @@ const MAX_BATCH_SIZE = 50000
  * @property {(table: string, name: string) => boolean | Promise<boolean>} indexExists
  * @property {(table: string, column: string, type: "string", args: AddColumnOptions) => void | Promise<void>} addColumn
  * @property {(table: string, columns: string[], options: IndexOptions) => void | Promise<void>} addIndex
+ */
+
+/**
+ * Structural adapter for explicit cutover/rollback column renames. This helper
+ * deliberately does not attempt generic MySQL/MariaDB primary-key, foreign-key,
+ * or contract cleanup DDL: callers must review and execute those separately.
+ *
+ * @typedef {object} CutoverAdapterLike
+ * @property {(table: string, column: string) => boolean | Promise<boolean>} columnExists
+ * @property {(table: string, from: string, to: string) => void | Promise<void>} renameColumn
  */
 
 /** @param {string} value @param {string} path */
@@ -124,6 +137,21 @@ function validateSpec(spec) {
  * @property {{table: string, column: string, count: number}[]} orphans Legacy references without a target row (informational; these rows still received derived UUIDs).
  */
 
+/**
+ * @typedef {object} CutoverVerificationReport
+ * @property {boolean} ok True when the verification gate passed and every rename pair is in a safe pre-cutover, cutover-complete, or resumable partial state.
+ * @property {string[]} problems Human-readable cutover blockers.
+ * @property {"pre-cutover" | "partial-cutover" | "cutover-retained"} state Current schema naming phase.
+ * @property {readonly CutoverStep[]} steps Deterministic forward rename steps.
+ * @property {readonly CutoverStep[]} rollbackSteps Deterministic rollback rename steps.
+ * @property {readonly RetainedColumn[]} retained Legacy integer columns that must remain during the retention window for rollback.
+ */
+
+/** @typedef {{legacyColumnPrefix: string}} CutoverPlanOptions */
+/** @typedef {{verificationReport: BackfillVerificationReport}} CutoverVerifyOptions */
+/** @typedef {{verificationReport: BackfillVerificationReport, retentionPhase: string}} CutoverExecuteOptions */
+/** @typedef {{retentionPhase: string}} CutoverRollbackOptions */
+
 /** @param {string} identifier */
 function quoteIdentifier(identifier) {
   return `\`${identifier}\``
@@ -204,6 +232,191 @@ function validateBackfillOptions(options) {
     throw new TypeError(`batchSize must be an integer between 1 and ${MAX_BATCH_SIZE}`)
   }
   return { namespace: options.namespace, batchSize, onProgress: options.onProgress }
+}
+
+const CUTOVER_RETENTION_PHASE = "legacy-columns-retained"
+
+/** @param {CutoverPlanOptions} options @param {readonly TableSpec[]} tables */
+function validateCutoverOptions(options, tables) {
+  if (options === null || typeof options !== "object") throw new TypeError("cutover options must be an object")
+  assertIdentifier(options.legacyColumnPrefix, "legacyColumnPrefix")
+  for (const table of tables) {
+    assertIdentifier(`${options.legacyColumnPrefix}id`, `retained column for ${table.table}.id`)
+    for (const reference of table.references) {
+      assertIdentifier(`${options.legacyColumnPrefix}${reference.name}_id`, `retained column for ${table.table}.${reference.name}_id`)
+    }
+    for (const polymorphic of table.polymorphic) {
+      assertIdentifier(`${options.legacyColumnPrefix}${polymorphic.name}_id`, `retained column for ${table.table}.${polymorphic.name}_id`)
+    }
+  }
+  return { legacyColumnPrefix: options.legacyColumnPrefix }
+}
+
+/** @param {BackfillVerificationReport} report */
+function validateVerificationReport(report) {
+  if (report === null || typeof report !== "object") throw new TypeError("verificationReport must be an object")
+  if (typeof report.ok !== "boolean" || !Array.isArray(report.problems) || !Array.isArray(report.orphans)) {
+    throw new TypeError("verificationReport must be the result of verifyBackfill()")
+  }
+  return report
+}
+
+/** @param {readonly TableSpec[]} tables @param {{legacyColumnPrefix: string}} options */
+function buildCutoverDescription(tables, options) {
+  /** @type {CutoverColumn[]} */
+  const columns = []
+  /** @type {CutoverColumn[][]} */
+  const columnGroups = []
+  for (const table of tables) {
+    /** @type {CutoverColumn[]} */
+    const tableColumns = [{ table: table.table, liveColumn: "id", shadowColumn: "uuid_id", retainedColumn: `${options.legacyColumnPrefix}id` }]
+    for (const reference of table.references) {
+      tableColumns.push({
+        table: table.table,
+        liveColumn: `${reference.name}_id`,
+        shadowColumn: `uuid_${reference.name}_id`,
+        retainedColumn: `${options.legacyColumnPrefix}${reference.name}_id`
+      })
+    }
+    for (const polymorphic of table.polymorphic) {
+      tableColumns.push({
+        table: table.table,
+        liveColumn: `${polymorphic.name}_id`,
+        shadowColumn: `uuid_${polymorphic.name}_id`,
+        retainedColumn: `${options.legacyColumnPrefix}${polymorphic.name}_id`
+      })
+    }
+    columnGroups.push(tableColumns)
+    columns.push(...tableColumns)
+  }
+  /** @type {RetainedColumn[]} */
+  const retained = columns.map((column) => ({
+    table: column.table,
+    sourceColumn: column.liveColumn,
+    retainedAs: column.retainedColumn,
+    restoreTo: column.liveColumn,
+    phase: CUTOVER_RETENTION_PHASE
+  }))
+  /** @type {CutoverStep[]} */
+  const steps = columns.flatMap((column) => ([
+    { kind: "rename-column", table: column.table, from: column.liveColumn, to: column.retainedColumn },
+    { kind: "rename-column", table: column.table, from: column.shadowColumn, to: column.liveColumn }
+  ]))
+  const rollbackColumns = [...columnGroups].reverse().flatMap((group) => group)
+  /** @type {CutoverStep[]} */
+  const rollbackSteps = rollbackColumns.flatMap((column) => ([
+    { kind: "rename-column", table: column.table, from: column.liveColumn, to: column.shadowColumn },
+    { kind: "rename-column", table: column.table, from: column.retainedColumn, to: column.liveColumn }
+  ]))
+  return {
+    columns: Object.freeze(columns.map((column) => Object.freeze(column))),
+    rollbackColumns: Object.freeze(rollbackColumns.map((column) => Object.freeze(column))),
+    verificationGate: "verifyBackfill.ok",
+    retentionPhase: CUTOVER_RETENTION_PHASE,
+    steps: Object.freeze(steps.map((step) => Object.freeze(step))),
+    rollbackSteps: Object.freeze(rollbackSteps.map((step) => Object.freeze(step))),
+    retained: Object.freeze(retained.map((entry) => Object.freeze(entry)))
+  }
+}
+
+/** @param {CutoverAdapterLike} adapter @param {CutoverColumn} column */
+async function cutoverColumnState(adapter, column) {
+  const liveExists = await adapter.columnExists(column.table, column.liveColumn)
+  const shadowExists = await adapter.columnExists(column.table, column.shadowColumn)
+  const retainedExists = await adapter.columnExists(column.table, column.retainedColumn)
+  if (liveExists && shadowExists && !retainedExists) return "pre-cutover"
+  if (!liveExists && shadowExists && retainedExists) return "mid-cutover"
+  if (liveExists && !shadowExists && retainedExists) return "cutover-retained"
+  if (!liveExists && !shadowExists && !retainedExists) return "missing"
+  return "conflict"
+}
+
+/**
+ * @param {CutoverAdapterLike} adapter
+ * @param {{verificationReport: BackfillVerificationReport | undefined, columns: readonly CutoverColumn[], steps: readonly CutoverStep[], rollbackSteps: readonly CutoverStep[], retained: readonly RetainedColumn[]}} args
+ * @returns {Promise<CutoverVerificationReport>}
+ */
+async function verifyCutoverState(adapter, { verificationReport, columns, steps, rollbackSteps, retained }) {
+  /** @type {CutoverVerificationReport} */
+  const report = {
+    ok: true,
+    problems: [],
+    state: "pre-cutover",
+    steps,
+    rollbackSteps,
+    retained
+  }
+  if (verificationReport !== undefined) {
+    const validated = validateVerificationReport(verificationReport)
+    if (!validated.ok) {
+      report.problems.push(`verifyBackfill must report ok before cutover: ${validated.problems.join("; ") || "verification gate failed"}`)
+    }
+  }
+  let preCutover = 0
+  let retainedCutover = 0
+  for (const column of columns) {
+    const state = await cutoverColumnState(adapter, column)
+    if (state === "conflict") {
+      report.problems.push(`${column.table}.${column.liveColumn} -> ${column.retainedColumn}: both columns exist; refusing ambiguous cutover state`)
+      continue
+    }
+    if (state === "missing") {
+      report.problems.push(`${column.table}.${column.liveColumn} -> ${column.retainedColumn}: neither live, shadow, nor retained column combination is valid`)
+      continue
+    }
+    if (state === "pre-cutover") preCutover += 1
+    if (state === "cutover-retained") retainedCutover += 1
+  }
+  if (report.problems.length === 0) {
+    if (preCutover === columns.length) report.state = "pre-cutover"
+    else if (retainedCutover === columns.length) report.state = "cutover-retained"
+    else report.state = "partial-cutover"
+  }
+  report.ok = report.problems.length === 0
+  return report
+}
+
+/** @param {CutoverExecuteOptions | CutoverRollbackOptions} options @param {string} action */
+function assertRetentionPhase(options, action) {
+  if (options.retentionPhase !== CUTOVER_RETENTION_PHASE) {
+    throw new TypeError(`${action} requires retentionPhase ${CUTOVER_RETENTION_PHASE}`)
+  }
+}
+
+/** @param {CutoverAdapterLike} adapter @param {readonly CutoverColumn[]} columns */
+async function applyCutoverColumns(adapter, columns) {
+  for (const column of columns) {
+    const state = await cutoverColumnState(adapter, column)
+    if (state === "cutover-retained") continue
+    if (state === "pre-cutover") {
+      await adapter.renameColumn(column.table, column.liveColumn, column.retainedColumn)
+      await adapter.renameColumn(column.table, column.shadowColumn, column.liveColumn)
+      continue
+    }
+    if (state === "mid-cutover") {
+      await adapter.renameColumn(column.table, column.shadowColumn, column.liveColumn)
+      continue
+    }
+    throw new Error(`${column.table}.${column.liveColumn} is not in a safe resumable cutover state`)
+  }
+}
+
+/** @param {CutoverAdapterLike} adapter @param {readonly CutoverColumn[]} columns */
+async function rollbackCutoverColumns(adapter, columns) {
+  for (const column of columns) {
+    const state = await cutoverColumnState(adapter, column)
+    if (state === "pre-cutover") continue
+    if (state === "cutover-retained") {
+      await adapter.renameColumn(column.table, column.liveColumn, column.shadowColumn)
+      await adapter.renameColumn(column.table, column.retainedColumn, column.liveColumn)
+      continue
+    }
+    if (state === "mid-cutover") {
+      await adapter.renameColumn(column.table, column.retainedColumn, column.liveColumn)
+      continue
+    }
+    throw new Error(`${column.table}.${column.liveColumn} is not in a safe rollback state`)
+  }
 }
 
 /**
@@ -523,6 +736,62 @@ export class UuidKeyMigration {
         }
         report.ok = report.problems.length === 0
         return report
+      },
+      /**
+       * Builds an explicit, rollback-aware column-name cutover plan that keeps
+       * legacy integer columns under retained names. It does not attempt
+       * generic PK/FK/constraint cleanup.
+       * @param {CutoverPlanOptions} options
+       */
+      planCutover(options) {
+        validateSpec(snapshot)
+        const validated = validateCutoverOptions(options, snapshot.tables)
+        const description = buildCutoverDescription(snapshot.tables, validated)
+        return Object.freeze({
+          verificationGate: description.verificationGate,
+          retentionPhase: description.retentionPhase,
+          steps: description.steps,
+          rollbackSteps: description.rollbackSteps,
+          retained: description.retained,
+          /**
+           * @param {CutoverAdapterLike} adapter
+           * @param {CutoverVerifyOptions} args
+           * @returns {Promise<CutoverVerificationReport>}
+           */
+          async verify(adapter, args) {
+            return verifyCutoverState(adapter, {
+              verificationReport: args.verificationReport,
+              columns: description.columns,
+              steps: description.steps,
+              rollbackSteps: description.rollbackSteps,
+              retained: description.retained
+            })
+          },
+          /**
+           * @param {CutoverAdapterLike} adapter
+           * @param {CutoverExecuteOptions} args
+           */
+          async execute(adapter, args) {
+            assertRetentionPhase(args, "cutover")
+            const report = await verifyCutoverState(adapter, {
+              verificationReport: args.verificationReport,
+              columns: description.columns,
+              steps: description.steps,
+              rollbackSteps: description.rollbackSteps,
+              retained: description.retained
+            })
+            if (!report.ok) throw new Error(report.problems.join("; "))
+            await applyCutoverColumns(adapter, description.columns)
+          },
+          /**
+           * @param {CutoverAdapterLike} adapter
+           * @param {CutoverRollbackOptions} args
+           */
+          async rollback(adapter, args) {
+            assertRetentionPhase(args, "rollback")
+            await rollbackCutoverColumns(adapter, description.rollbackColumns)
+          }
+        })
       }
     })
   }

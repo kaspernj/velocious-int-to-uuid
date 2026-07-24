@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add explicit cutover planning via `plan.planCutover({ legacyColumnPrefix })`, including deterministic forward and rollback rename plans, readiness verification gated on `verifyBackfill.ok`, guarded resumable execution, and retention metadata for preserved integer columns.
+- Document and type a concrete rollback window: cutover only renames columns into canonical UUID names while retaining legacy integer columns under caller-chosen names for the `legacy-columns-retained` phase; it still does not attempt generic PK/FK/constraint cleanup DDL.
+
 ## 0.2.1 - 2026-07-23
 
 - Compare related UUID columns bytewise with the MariaDB/MySQL BINARY operator during verification, avoiding collation errors when child and parent UUID columns use different collations.

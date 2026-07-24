@@ -1,10 +1,18 @@
 # velocious-int-to-uuid
 
-Safe, deliberately small expand-phase planning for staged integer-to-UUID migrations in MySQL/MariaDB Velocious applications.
+Safe, deliberately small staged integer-to-UUID migration helpers for MySQL/MariaDB Velocious applications.
 
-## v0.1 scope
+The package covers three explicit phases:
 
-This release only adds nullable `varchar(36)` shadow columns and named indexes through Velocious migration helpers. It never changes or drops a legacy ID, primary key, column, index, or foreign key; never adds a foreign key; never backfills data; and never performs primary-key cutover or contract cleanup. MySQL/MariaDB DDL is not transactional, so every schema operation is independently guarded by `columnExists` or `indexExists` and a partially completed expand can be rerun.
+- `plan.expand(migration)`: additive, idempotent creation of nullable UUID shadow columns and indexes.
+- `plan.backfill(runner, options)` plus `plan.verifyBackfill(runner)`: deterministic RFC 4122 v5 backfill and read-only verification gates.
+- `plan.planCutover({ legacyColumnPrefix })`: explicit canonical-name cutover and rollback planning that retains legacy integer columns for a rollback window.
+
+The package still does not attempt generic MySQL/MariaDB primary-key swaps, foreign-key recreation, NOT NULL/unique rewrites, or destructive contract cleanup. Those steps are application-specific and must stay separately reviewed.
+
+## Manifest and expand
+
+`UuidKeyMigration.define(...)` remains explicit: every table must provide `references` and `polymorphic` arrays, using empty arrays when it has none, and the library never infers relationships. Every declared table receives `uuid_id` and an index. A reference named `author` receives `uuid_author_id` and a single-column index. A polymorphic relationship named `subject` receives `uuid_subject_id` and an index on `subject_type, uuid_subject_id`. Reference targets must be declared tables. Polymorphic discriminator-to-target mappings are explicit and one-to-one; duplicate discriminators or duplicate targets are rejected as ambiguous. Self-references are supported.
 
 ```js
 import { UuidKeyMigration } from "velocious-int-to-uuid"
@@ -38,8 +46,6 @@ export async function up(migration) {
 }
 ```
 
-Every table must explicitly provide `references` and `polymorphic` arrays, using empty arrays when it has none; the library never infers relationships. Every declared table receives `uuid_id` and an index. A reference named `author` receives `uuid_author_id` and a single-column index. A polymorphic relationship named `subject` receives `uuid_subject_id` and an index on `subject_type, uuid_subject_id`. Reference targets must be declared tables. Polymorphic discriminator-to-target mappings are explicit and one-to-one in v0.1; duplicate discriminators or duplicate targets are rejected as ambiguous. Self-references are supported.
-
 The migration object is structural: it needs async or synchronous `columnExists(table, column)`, `indexExists(table, indexName)`, `addColumn(table, column, columnType, args)`, and `addIndex(table, columns, options)` methods. For every shadow column, the exact Velocious call is `addColumn(table, column, "string", { maxLength: 36, null: true })`, which Velocious represents as a nullable SQL `varchar(36)`. The package does not import Velocious internals at runtime. `velocious` remains a peer dependency.
 
 ## Deterministic backfill and verification
@@ -54,9 +60,51 @@ Integer ids are read from rows and interpolated into SQL predicates and UUID der
 
 `verifyBackfill` runs each check as an independent read and opens no transaction of its own, so against a live, actively-written database successive queries can observe different snapshots. Treat it as a cutover gate only with writes quiesced, or pass a runner/transaction that serves every query one consistent snapshot.
 
-## Staged migration after expand and backfill
+## Cutover and rollback retention
 
-Application owners must implement and deploy later phases separately: dual-write plus UUID-first/legacy-fallback reads; then a separately reviewed contract migration and primary-key cutover. None of these phases is represented by a no-op or pretend API.
+`plan.planCutover({ legacyColumnPrefix })` builds a deterministic plan for renaming UUID shadow columns into canonical application names while preserving the legacy integer columns under retained names such as `legacy_id` and `legacy_author_id`. The prefix is explicit and validated; nothing is inferred.
+
+```js
+const cutover = plan.planCutover({ legacyColumnPrefix: "legacy_" })
+const report = await plan.verifyBackfill(runner)
+if (!report.ok) throw new Error(report.problems.join("; "))
+
+const readiness = await cutover.verify(adapter, { verificationReport: report })
+if (!readiness.ok) throw new Error(readiness.problems.join("; "))
+
+await cutover.execute(adapter, {
+  verificationReport: report,
+  retentionPhase: cutover.retentionPhase
+})
+```
+
+The cutover adapter is structural and intentionally narrow: it only needs `columnExists(table, column)` and `renameColumn(table, from, to)`. Forward cutover is limited to guarded column renames:
+
+- `id -> legacy_id`, then `uuid_id -> id`
+- `author_id -> legacy_author_id`, then `uuid_author_id -> author_id`
+- polymorphic `subject_id -> legacy_subject_id`, then `uuid_subject_id -> subject_id`
+
+`cutover.verify(...)` fails closed unless `verifyBackfill` already reported `ok`, and unless every logical column triple is in one of three safe states:
+
+- pre-cutover: live integer column plus UUID shadow column
+- partial-cutover: retained integer column plus UUID shadow column
+- cutover-retained: retained integer column plus canonical UUID column
+
+Any ambiguous collision, such as both `id` and `legacy_id` already existing before the legacy rename, is rejected. `cutover.execute(...)` is resumable and idempotent across those safe states.
+
+Rollback is equally explicit:
+
+```js
+await cutover.rollback(adapter, {
+  retentionPhase: cutover.retentionPhase
+})
+```
+
+Rollback only operates during the documented `legacy-columns-retained` phase. It renames canonical UUID columns back to their `uuid_*` names and restores the retained integer columns to their legacy names. There is no automatic cleanup API after that phase: once the retained integer columns are intentionally dropped in a separate contract migration, package-supported rollback is over by design.
+
+## Safety boundary
+
+The package helps with canonical column naming and rollback retention, not full physical primary-key conversion. After cutover, a MySQL/MariaDB table may still have its original PK/FK/auto-increment semantics attached to the retained integer columns until the application performs separately reviewed DDL. The library does not pretend those operations are safely generic.
 
 ## Development
 
