@@ -100,6 +100,29 @@ test("cutover verify fails closed when backfill verification did not pass", asyn
   ])
 })
 
+test("cutover verify fails closed when verificationReport is missing", async () => {
+  const adapter = new FakeCutoverAdapter(expandedColumns())
+  const cutover = UuidKeyMigration.define(spec()).planCutover({ legacyColumnPrefix: "legacy_" })
+
+  const report = await cutover.verify(adapter, {})
+
+  assert.equal(report.ok, false)
+  assert.deepEqual(report.problems, ["verificationReport must be the successful result of verifyBackfill() before cutover"])
+})
+
+test("cutover execute rejects when verificationReport is missing", async () => {
+  const adapter = new FakeCutoverAdapter(expandedColumns())
+  const cutover = UuidKeyMigration.define(spec()).planCutover({ legacyColumnPrefix: "legacy_" })
+
+  await assert.rejects(
+    cutover.execute(adapter, {
+      retentionPhase: RETENTION_PHASE
+    }),
+    /verificationReport must be the successful result of verifyBackfill\(\) before cutover/
+  )
+  assert.deepEqual(adapter.calls, [])
+})
+
 test("cutover execute renames canonical UUID columns while retaining legacy integers and is idempotent", async () => {
   const adapter = new FakeCutoverAdapter(expandedColumns())
   const cutover = UuidKeyMigration.define(spec()).planCutover({ legacyColumnPrefix: "legacy_" })

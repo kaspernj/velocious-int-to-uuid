@@ -261,6 +261,18 @@ function validateVerificationReport(report) {
   return report
 }
 
+/**
+ * @param {BackfillVerificationReport} report
+ * @returns {BackfillVerificationReport}
+ */
+function requireSuccessfulVerificationReport(report) {
+  const validated = validateVerificationReport(report)
+  if (!validated.ok) {
+    throw new Error(`verifyBackfill must report ok before cutover: ${validated.problems.join("; ") || "verification gate failed"}`)
+  }
+  return validated
+}
+
 /** @param {readonly TableSpec[]} tables @param {{legacyColumnPrefix: string}} options */
 function buildCutoverDescription(tables, options) {
   /** @type {CutoverColumn[]} */
@@ -333,7 +345,7 @@ async function cutoverColumnState(adapter, column) {
 
 /**
  * @param {CutoverAdapterLike} adapter
- * @param {{verificationReport: BackfillVerificationReport | undefined, columns: readonly CutoverColumn[], steps: readonly CutoverStep[], rollbackSteps: readonly CutoverStep[], retained: readonly RetainedColumn[]}} args
+ * @param {{verificationReport: BackfillVerificationReport, columns: readonly CutoverColumn[], steps: readonly CutoverStep[], rollbackSteps: readonly CutoverStep[], retained: readonly RetainedColumn[]}} args
  * @returns {Promise<CutoverVerificationReport>}
  */
 async function verifyCutoverState(adapter, { verificationReport, columns, steps, rollbackSteps, retained }) {
@@ -346,10 +358,13 @@ async function verifyCutoverState(adapter, { verificationReport, columns, steps,
     rollbackSteps,
     retained
   }
-  if (verificationReport !== undefined) {
-    const validated = validateVerificationReport(verificationReport)
-    if (!validated.ok) {
-      report.problems.push(`verifyBackfill must report ok before cutover: ${validated.problems.join("; ") || "verification gate failed"}`)
+  if (verificationReport === undefined) {
+    report.problems.push("verificationReport must be the successful result of verifyBackfill() before cutover")
+  } else {
+    try {
+      requireSuccessfulVerificationReport(verificationReport)
+    } catch (error) {
+      report.problems.push(/** @type {Error} */ (error).message)
     }
   }
   let preCutover = 0
@@ -773,6 +788,10 @@ export class UuidKeyMigration {
            */
           async execute(adapter, args) {
             assertRetentionPhase(args, "cutover")
+            if (args.verificationReport === undefined) {
+              throw new Error("verificationReport must be the successful result of verifyBackfill() before cutover")
+            }
+            requireSuccessfulVerificationReport(args.verificationReport)
             const report = await verifyCutoverState(adapter, {
               verificationReport: args.verificationReport,
               columns: description.columns,
