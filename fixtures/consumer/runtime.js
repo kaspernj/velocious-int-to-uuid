@@ -14,3 +14,10 @@ const report = await plan.verifyBackfill({ query: async () => [{ c: 0 }] })
 if (report.ok !== true || report.problems.length !== 0) process.exit(1)
 
 await plan.backfill({ query: async (sql) => sql.startsWith("SELECT") ? [] : [] }, { namespace: "6ba7b810-9dad-11d1-80b4-00c04fd430c8" })
+
+const cutover = plan.planCutover({ legacyColumnPrefix: "legacy_" })
+const cutoverReport = await cutover.verify({
+  columnExists: async (_table, column) => ["id", "uuid_id"].includes(column),
+  renameColumn: async () => {}
+}, { verificationReport: report })
+if (cutoverReport.ok !== true || cutover.retentionPhase !== "legacy-columns-retained") process.exit(1)

@@ -25,9 +25,27 @@ const derived: string = uuidForRecord({ namespace: uuidV5("6ba7b810-9dad-11d1-80
 const report = await plan.verifyBackfill({ query: async (_sql: string) => [{ c: 0 }] })
 const reportOk: boolean = report.ok
 const problems: string[] = report.problems
+const cutover = plan.planCutover({ legacyColumnPrefix: "legacy_" })
+const cutoverReport = await cutover.verify({
+  columnExists: async (_table, _column) => true,
+  renameColumn: async (_table, _from, _to) => {}
+}, { verificationReport: report })
+const cutoverOk: boolean = cutoverReport.ok
+const retentionPhase: string = cutover.retentionPhase
+await cutover.execute({
+  columnExists: async (_table, _column) => true,
+  renameColumn: async (_table, _from, _to) => {}
+}, {
+  verificationReport: report,
+  retentionPhase
+})
+await cutover.rollback({
+  columnExists: async (_table, _column) => true,
+  renameColumn: async (_table, _from, _to) => {}
+}, { retentionPhase })
 await plan.backfill({ query: async (_sql: string) => [] }, {
   namespace: "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
   batchSize: 100,
   onProgress: (progress) => { const updated: number = progress.updated; void updated }
 })
-void [derived, reportOk, problems]
+void [derived, reportOk, problems, cutoverOk]
