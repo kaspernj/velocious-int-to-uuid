@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve exact MySQL/MariaDB `BIGINT` values during deterministic backfill by casting every selected legacy row/root/relationship id to a decimal string under stable aliases before it reaches UUID derivation or batch ordering; no driver-wide configuration is required, and unsafe JavaScript numbers remain rejected.
+
 ## 0.3.0 - 2026-07-24
 
 - Add explicit cutover planning via `plan.planCutover({ legacyColumnPrefix })`, including deterministic forward and rollback rename plans, readiness verification gated on `verifyBackfill.ok`, guarded resumable execution, and retention metadata for preserved integer columns.
