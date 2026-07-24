@@ -54,10 +54,10 @@ test("uuidForRecord rejects unsafe integer numbers but keeps string and bigint f
 
 test("backfill fills primary keys, references, and scoped polymorphic mappings with derived UUIDs", async () => {
   const runner = new FakeRunner([
-    [{ id: 1 }, { id: 2 }],
-    [{ id: 7 }],
-    [{ id: 7, author_id: 1 }],
-    [{ id: 7, subject_id: 2 }]
+    [{ __uuid_row_id: "1", __uuid_source_id: "1" }, { __uuid_row_id: "2", __uuid_source_id: "2" }],
+    [{ __uuid_row_id: "7", __uuid_source_id: "7" }],
+    [{ __uuid_row_id: "7", __uuid_source_id: "1" }],
+    [{ __uuid_row_id: "7", __uuid_source_id: "2" }]
   ])
   const progress = []
   await UuidKeyMigration.define({ tables: [
@@ -85,13 +85,13 @@ test("backfill fills primary keys, references, and scoped polymorphic mappings w
 })
 
 test("backfill loops full batches until a short batch and validates row values", async () => {
-  const full = Array.from({ length: 2 }, (_, i) => ({ id: i + 1 }))
-  const runner = new FakeRunner([full, [{ id: 3 }]])
+  const full = Array.from({ length: 2 }, (_, i) => ({ __uuid_row_id: String(i + 1), __uuid_source_id: String(i + 1) }))
+  const runner = new FakeRunner([full, [{ __uuid_row_id: "3", __uuid_source_id: "3" }]])
   await UuidKeyMigration.define({ tables: [{ table: "users", references: [], polymorphic: [] }] })
     .backfill(runner, { namespace: NAMESPACE, batchSize: 2 })
   assert.equal(runner.queries.filter((sql) => sql.startsWith("UPDATE")).length, 2)
 
-  const poisoned = new FakeRunner([[{ id: "1 OR 1=1" }]])
+  const poisoned = new FakeRunner([[{ __uuid_row_id: "1 OR 1=1", __uuid_source_id: "1 OR 1=1" }]])
   await assert.rejects(
     UuidKeyMigration.define({ tables: [{ table: "users", references: [], polymorphic: [] }] })
       .backfill(poisoned, { namespace: NAMESPACE }),
@@ -100,7 +100,7 @@ test("backfill loops full batches until a short batch and validates row values",
 })
 
 test("backfill rejects unsafe integer numbers returned by the driver", async () => {
-  const unsafe = new FakeRunner([[{ id: Number.MAX_SAFE_INTEGER + 1 }]])
+  const unsafe = new FakeRunner([[{ __uuid_row_id: Number.MAX_SAFE_INTEGER + 1, __uuid_source_id: Number.MAX_SAFE_INTEGER + 1 }]])
   await assert.rejects(
     UuidKeyMigration.define({ tables: [{ table: "users", references: [], polymorphic: [] }] })
       .backfill(unsafe, { namespace: NAMESPACE }),
@@ -108,12 +108,45 @@ test("backfill rejects unsafe integer numbers returned by the driver", async () 
   )
 })
 
+test("backfill selects every UUID and cursor integer as an exact decimal string", async () => {
+  const runner = new FakeRunner()
+  await UuidKeyMigration.define(spec()).backfill(runner, { namespace: NAMESPACE })
+
+  const selects = runner.queries.filter((sql) => sql.startsWith("SELECT"))
+  assert.equal(selects.length, 4)
+  assert.ok(selects.every((sql) => sql.includes("CAST(source.`id` AS CHAR) AS `__uuid_row_id`")))
+  assert.ok(selects.some((sql) => sql.includes("CAST(source.`id` AS CHAR) AS `__uuid_source_id` FROM `users` AS source")))
+  assert.ok(selects.some((sql) => sql.includes("CAST(source.`author_id` AS CHAR) AS `__uuid_source_id` FROM `posts` AS source")))
+  assert.ok(selects.some((sql) => sql.includes("CAST(source.`subject_id` AS CHAR) AS `__uuid_source_id` FROM `posts` AS source")))
+})
+
+test("backfill preserves adjacent bigint strings without UUID collision or cursor skip", async () => {
+  const first = "9007199254740995"
+  const second = "9007199254740996"
+  const runner = new FakeRunner([
+    [
+      { __uuid_row_id: first, __uuid_source_id: first },
+      { __uuid_row_id: second, __uuid_source_id: second }
+    ]
+  ])
+
+  await UuidKeyMigration.define({ tables: [{ table: "users", references: [], polymorphic: [] }] })
+    .backfill(runner, { namespace: NAMESPACE, batchSize: 2 })
+
+  const update = runner.queries.find((sql) => sql.startsWith("UPDATE"))
+  assert.ok(update)
+  assert.match(update, new RegExp(`WHEN ${first} THEN '${uuidForRecord({ namespace: NAMESPACE, table: "users", id: first })}'`))
+  assert.match(update, new RegExp(`WHEN ${second} THEN '${uuidForRecord({ namespace: NAMESPACE, table: "users", id: second })}'`))
+  assert.ok(update.includes(`WHERE \`id\` IN (${first}, ${second})`))
+  assert.equal(runner.queries.filter((sql) => sql.startsWith("SELECT")).length, 2)
+})
+
 test("backfill updates compare the selected reference source and polymorphic type", async () => {
   const runner = new FakeRunner([
     [],
     [],
-    [{ id: 7, author_id: 1 }],
-    [{ id: 7, subject_id: 2 }]
+    [{ __uuid_row_id: "7", __uuid_source_id: "1" }],
+    [{ __uuid_row_id: "7", __uuid_source_id: "2" }]
   ])
   await UuidKeyMigration.define(spec()).backfill(runner, { namespace: NAMESPACE })
 
@@ -124,7 +157,7 @@ test("backfill updates compare the selected reference source and polymorphic typ
 })
 
 test("backfill compares polymorphic discriminators case-sensitively via BINARY in select and update", async () => {
-  const runner = new FakeRunner([[], [], [], [{ id: 7, subject_id: 2 }]])
+  const runner = new FakeRunner([[], [], [], [{ __uuid_row_id: "7", __uuid_source_id: "2" }]])
   await UuidKeyMigration.define(spec()).backfill(runner, { namespace: NAMESPACE })
   const selects = runner.queries.filter((sql) => sql.startsWith("SELECT") && sql.includes("subject_type"))
   const updates = runner.queries.filter((sql) => sql.startsWith("UPDATE") && sql.includes("subject_type"))
@@ -160,6 +193,13 @@ test("verifyBackfill reports ok with zero counts and collects problems and orpha
   assert.ok(dirtyReport.problems.some((problem) => problem.includes("users.uuid_id: 4 rows without a backfilled UUID")))
   assert.ok(dirtyReport.problems.some((problem) => problem.includes("posts.uuid_author_id: 4 rows whose UUID disagrees")))
   assert.deepEqual(dirtyReport.orphans.filter((orphan) => orphan.column === "uuid_subject_id"), [{ table: "posts", column: "uuid_subject_id", count: 4 }])
+})
+
+test("verifyBackfill rejects counts that cannot be represented exactly", async () => {
+  await assert.rejects(
+    UuidKeyMigration.define(spec()).verifyBackfill(new FakeRunner([], "9007199254740995")),
+    /safe-integer count/
+  )
 })
 
 test("verifyBackfill fails closed when a polymorphic row has an unmapped discriminator", async () => {

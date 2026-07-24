@@ -157,6 +157,20 @@ function quoteIdentifier(identifier) {
   return `\`${identifier}\``
 }
 
+/**
+ * Selects a MySQL/MariaDB integer without allowing the driver to coerce BIGINT
+ * to an imprecise JavaScript number.
+ * @param {string} tableAlias
+ * @param {string} column
+ * @param {string} alias
+ */
+function decimalStringSelection(tableAlias, column, alias) {
+  assertIdentifier(tableAlias, "SELECT table alias")
+  assertIdentifier(column, "SELECT integer column")
+  assertIdentifier(alias, "SELECT integer alias")
+  return `CAST(${tableAlias}.${quoteIdentifier(column)} AS CHAR) AS ${quoteIdentifier(alias)}`
+}
+
 /** @param {string} value */
 function sqlStringLiteral(value) {
   for (const character of value) {
@@ -219,7 +233,7 @@ function integerIdString(value, context) {
 /** @param {unknown} value @param {string} context */
 function countFrom(value, context) {
   const count = Number(value)
-  if (!Number.isFinite(count)) throw new TypeError(`${context} did not return a numeric count`)
+  if (!Number.isSafeInteger(count) || count < 0) throw new TypeError(`${context} did not return a non-negative safe-integer count`)
   return count
 }
 
@@ -449,12 +463,15 @@ async function rollbackCutoverColumns(adapter, columns) {
  * @param {{namespace: string, batchSize: number, onProgress: BackfillOptions["onProgress"]}} args.options Validated options.
  */
 async function backfillColumn(runner, { table, column, sourceColumn, targetTable, typeColumn, typeValue, options }) {
+  const tableAlias = "source"
+  const rowIdAlias = "__uuid_row_id"
+  const sourceIdAlias = "__uuid_source_id"
   const conditions = [`${quoteIdentifier(column)} IS NULL`, `${quoteIdentifier(sourceColumn)} IS NOT NULL`]
   if (typeColumn !== undefined && typeValue !== undefined) {
     conditions.push(discriminatorEquals(quoteIdentifier(typeColumn), typeValue))
   }
-  const select = `SELECT ${quoteIdentifier("id")}, ${quoteIdentifier(sourceColumn)} FROM ${quoteIdentifier(table)} ` +
-    `WHERE ${conditions.join(" AND ")} ORDER BY ${quoteIdentifier("id")} LIMIT ${options.batchSize}`
+  const select = `SELECT ${decimalStringSelection(tableAlias, "id", rowIdAlias)}, ${decimalStringSelection(tableAlias, sourceColumn, sourceIdAlias)} ` +
+    `FROM ${quoteIdentifier(table)} AS ${tableAlias} WHERE ${conditions.join(" AND ")} ORDER BY ${tableAlias}.${quoteIdentifier("id")} LIMIT ${options.batchSize}`
 
   for (;;) {
     const rows = await runner.query(select)
@@ -463,8 +480,8 @@ async function backfillColumn(runner, { table, column, sourceColumn, targetTable
     const ids = []
     const sourceMatches = []
     for (const row of rows) {
-      const rowId = integerIdString(row.id, `${table}.id`)
-      const sourceValue = integerIdString(row[sourceColumn], `${table}.${sourceColumn}`)
+      const rowId = integerIdString(row[rowIdAlias], `${table}.id`)
+      const sourceValue = integerIdString(row[sourceIdAlias], `${table}.${sourceColumn}`)
       const uuid = uuidForRecord({ namespace: options.namespace, table: targetTable, id: sourceValue })
       ids.push(rowId)
       cases.push(`WHEN ${rowId} THEN '${uuid}'`)
