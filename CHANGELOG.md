@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-24
+
 - Add explicit cutover planning via `plan.planCutover({ legacyColumnPrefix })`, including deterministic forward and rollback rename plans, readiness verification gated on `verifyBackfill.ok`, guarded resumable execution, and retention metadata for preserved integer columns.
 - Document and type a concrete rollback window: cutover only renames columns into canonical UUID names while retaining legacy integer columns under caller-chosen names for the `legacy-columns-retained` phase; it still does not attempt generic PK/FK/constraint cleanup DDL.
 
