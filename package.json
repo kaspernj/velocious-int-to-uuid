@@ -1,6 +1,6 @@
 {
   "name": "velocious-int-to-uuid",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Safe staged integer-to-UUID migration helpers for Velocious on MySQL/MariaDB",
   "type": "module",
   "exports": {

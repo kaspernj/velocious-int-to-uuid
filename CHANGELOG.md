@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 - 2026-07-24
 
 - Preserve exact MySQL/MariaDB `BIGINT` values during deterministic backfill by casting every selected legacy row/root/relationship id to a decimal string under stable aliases before it reaches UUID derivation or batch ordering; no driver-wide configuration is required, and unsafe JavaScript numbers remain rejected.
 
