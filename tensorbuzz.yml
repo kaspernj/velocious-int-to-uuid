@@ -6,5 +6,20 @@ before_script:
 builds:
   validate:
     name: Validate
+    paths:
+      - src/**
+      - test/**
+      - fixtures/**
+      - package.json
+      - package-lock.json
+      - tsconfig.json
+      - eslint.config.js
+      - Dockerfile
+      - compose.yml
+      - compose.ci.yml
+      - README.md
+      - CHANGELOG.md
+      - LICENSE
+      - "!docs/**"
     script:
       - npm run validate
