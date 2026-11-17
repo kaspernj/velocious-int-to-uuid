@@ -1,7 +1,8 @@
 base_image: kaspernj/tensorbuzz-base-ubuntu-26-04:latest
 
-before_script:
-  - npm ci --ignore-scripts --legacy-peer-deps
+dependency_roots:
+  - path: .
+    package_manager: npm
 
 builds:
   validate:
